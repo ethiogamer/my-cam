@@ -161,6 +161,9 @@ jobs:
           --add-binary "bin/platform-tools/AdbWinApi.dll;platform-tools"
           --add-binary "bin/platform-tools/AdbWinUsbApi.dll;platform-tools"
           --add-data "bin/CamBridge.apk;."
+          --add-data "../LICENSE;."
+          --add-data "../THIRD_PARTY_NOTICES.md;."
+          --add-data "../licenses;licenses"
           --hidden-import pystray._win32
           --collect-submodules zeroconf
           --hidden-import ifaddr
@@ -196,5 +199,5 @@ jobs:
           gh release delete latest --repo "$REPO" --yes --cleanup-tag || true
           gh release create latest --repo "$REPO" \
             --title "CamBridge (latest)" \
-            --notes "CamBridge.exe → run on Windows (works with iPhone and Android). CamBridge.apk → Android app (the PC installs it for you). CamBridge.ipa → iPhone app, install with Sideloadly. Built from ${GITHUB_SHA::7}." \
+            --notes "Free to use — see LICENSE. CamBridge.exe → run on Windows (works with iPhone and Android). CamBridge.apk → Android app (the PC installs it for you). CamBridge.ipa → iPhone app, install with Sideloadly. Built from ${GITHUB_SHA::7}." \
             out/CamBridge-iPhone/CamBridge.ipa out/CamBridge-Windows/CamBridge.exe out/CamBridge-Android/CamBridge.apk

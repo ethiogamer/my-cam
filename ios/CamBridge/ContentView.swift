@@ -402,6 +402,12 @@ private struct WifiSheet: View {
                         }
                     }
                 }
+                Section(header: Text("About")) {
+                    NavigationLink("License & credits") { LicenseView() }
+                    Text("CamBridge · free to use · © 2026 ethiogamer")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
             }
             .navigationTitle("Wi-Fi")
             .navigationBarTitleDisplayMode(.inline)
@@ -411,6 +417,26 @@ private struct WifiSheet: View {
                 }
             }
         }
+    }
+}
+
+private struct LicenseView: View {
+    private var text: String {
+        guard let url = Bundle.main.url(forResource: "Licenses", withExtension: "txt"),
+              let content = try? String(contentsOf: url, encoding: .utf8) else {
+            return "CamBridge — free to use. © 2026 ethiogamer."
+        }
+        return content
+    }
+
+    var body: some View {
+        ScrollView {
+            Text(text)
+                .font(.system(size: 11, design: .monospaced))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+        }
+        .navigationTitle("License & credits")
     }
 }
 

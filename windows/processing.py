@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 DEFAULT_ADJUST = {"brightness": 0, "contrast": 0, "saturation": 0, "warmth": 0, "tint": 0}
 DEFAULT_FRAMING = {"zoom": 1.0, "pan_x": 0.0, "pan_y": 0.0, "rotate": 0, "mirror": False, "flip": False}
 
-# Quick looks (like Camo's filters): each is just a set of adjustments.
+# Quick looks: each filter is just a preset of the adjustments above.
 FILTERS = {
     "None": {},
     "Vivid": {"saturation": 35, "contrast": 15},

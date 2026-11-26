@@ -76,3 +76,11 @@ The iPhone app stops opening after 7 days. Plug in the phone, open Sideloadly, a
 - **Windows (Python):** receives frames → "CamBridge" DirectShow virtual camera
   (a renamed build of the open-source [Softcam](https://github.com/tshino/softcam) library, MIT).
 - **Build:** GitHub Actions builds both apps on every push (macOS runner for the iPhone app).
+
+## License
+
+CamBridge is **free to use** (personal and business). It is not open source: copying, changing,
+reselling or re-uploading it needs permission from the author. See [LICENSE](LICENSE).
+
+CamBridge uses some open-source components, credited in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) with their licenses in the `licenses` folder.

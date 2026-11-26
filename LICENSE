@@ -1,0 +1,50 @@
+CamBridge — Free License
+Copyright (c) 2026 ethiogamer (https://github.com/ethiogamer). All rights reserved.
+
+CamBridge (the Windows app, the iPhone app and the Android app, together "the Software")
+is free to download and use. It is not open source: the copyright owner keeps all rights
+that are not given to you below.
+
+1. WHAT YOU MAY DO
+   a. Download, install and use the official, unmodified Software, free of charge, for
+      personal or business purposes, on as many of your own devices as you like.
+   b. Share links to the official download page.
+   c. Read the source code published by the copyright owner, to learn how the Software
+      works or to check that it is safe.
+
+2. WHAT YOU MAY NOT DO (without written permission from the copyright owner)
+   a. Sell, rent, or charge money for the Software, or include it in a paid product or
+      service.
+   b. Copy, change, translate, or build other products from the Software or its source
+      code, or publish changed versions.
+   c. Re-upload or redistribute the Software or its source code, other than sharing links
+      to the official download page.
+   d. Remove or change the CamBridge name, copyright notices, or this license.
+   e. Use the CamBridge name or logo for another product.
+
+3. OPEN-SOURCE PARTS
+   The Software includes open-source components made by others. Each of them stays under
+   its own license, listed in THIRD_PARTY_NOTICES.md and the "licenses" folder. Nothing in
+   this license limits the rights those licenses give you. In particular, for the
+   components under the GNU Lesser General Public License (LGPL), you may modify and
+   rebuild the Software for your own use solely to replace or change those components,
+   and reverse-engineer it as far as the LGPL allows for debugging such changes.
+
+4. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", FREE OF CHARGE, WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR
+   A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+
+5. LIMITATION OF LIABILITY
+   TO THE MAXIMUM EXTENT ALLOWED BY LAW, THE COPYRIGHT OWNER IS NOT LIABLE FOR ANY CLAIM,
+   DAMAGES OR OTHER LIABILITY (INCLUDING LOSS OF DATA, HARDWARE DAMAGE OR LOST PROFITS)
+   ARISING FROM THE USE OF, OR INABILITY TO USE, THE SOFTWARE.
+
+6. ENDING THIS LICENSE
+   If you break these terms, your permission to use the Software ends automatically.
+
+7. CHANGES
+   The copyright owner may publish new versions of the Software under different terms.
+   Versions you already downloaded stay under the license they came with.
+
+Questions or permission requests: open an issue at https://github.com/ethiogamer/my-cam

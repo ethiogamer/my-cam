@@ -133,10 +133,34 @@ class MainActivity : ComponentActivity() {
             labels.add("Forget ${pc.name}")
             actions.add { wifi.forget(pc.id) }
         }
+        labels.add("ⓘ  About CamBridge & licenses")
+        actions.add { showLicenses() }
         AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
             .setTitle(if (wifi.status.isEmpty()) "Connect over Wi-Fi" else wifi.status)
             .setItems(labels.toTypedArray()) { _, which -> actions[which]() }
             .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun showLicenses() {
+        val text = try {
+            assets.open("licenses.txt").bufferedReader().use { it.readText() }
+        } catch (_: Exception) {
+            "CamBridge — free to use. © 2026 ethiogamer."
+        }
+        val view = android.widget.ScrollView(this).apply {
+            addView(TextView(this@MainActivity).apply {
+                this.text = text
+                textSize = 11f
+                typeface = Typeface.MONOSPACE
+                setTextColor(Color.rgb(230, 230, 230))
+                setPadding(dp(18), dp(12), dp(18), dp(12))
+            })
+        }
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("CamBridge — license & credits")
+            .setView(view)
+            .setPositiveButton("Close", null)
             .show()
     }
 

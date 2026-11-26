@@ -1,4 +1,4 @@
-"""The CamBridge window (Camo-style layout).
+"""The CamBridge main window.
 
  ┌ top bar:  ☰  CamBridge  ● status            profile ▾   ⏸ Pause   ● Record   ☰ ┐
  │ left sidebar        │            live preview              │ right sidebar      │
@@ -754,7 +754,8 @@ class App:
         row.pack(fill="x")
         flat_button(row, "Recordings folder", self.open_recordings).pack(side="left")
         flat_button(row, "Repair camera", self.repair).pack(side="left", padx=6)
-        tk.Label(app, text="Version %s" % self._core("VERSION", ""), font=(FONT, 8), bg=C["card"],
+        flat_button(app, "License & credits", self.show_licenses).pack(anchor="w", pady=(6, 0))
+        tk.Label(app, text="CamBridge %s · free to use · © 2026 ethiogamer" % self._core("VERSION", ""), font=(FONT, 8), bg=C["card"],
                  fg=C["faint"], anchor="w").pack(fill="x", pady=(8, 0))
         self._gap(p, 10)
 
@@ -898,6 +899,39 @@ class App:
                 self.show_toast(path)
         except OSError:
             self.show_toast(path)
+
+    def show_licenses(self):
+        texts = []
+        for name in ["LICENSE", "THIRD_PARTY_NOTICES.md"]:
+            path = self._resource(name)
+            if not os.path.exists(path):
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", name)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    texts.append(f.read())
+            except OSError:
+                pass
+        folder = self._resource("licenses")
+        if not os.path.isdir(folder):
+            folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "licenses")
+        if os.path.isdir(folder):
+            for name in sorted(os.listdir(folder)):
+                try:
+                    with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as f:
+                        texts.append("licenses/%s\n\n%s" % (name, f.read()))
+                except OSError:
+                    pass
+        win = tk.Toplevel(self.root, bg=C["bg"])
+        win.title("CamBridge — license and open-source credits")
+        win.geometry("760x620")
+        text = tk.Text(win, wrap="word", bg=C["card"], fg=C["fg"], font=("Consolas", 9), bd=0,
+                       padx=14, pady=12, insertbackground=C["fg"])
+        bar = ttk.Scrollbar(win, command=text.yview)
+        text.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", ("\n\n" + "=" * 70 + "\n\n").join(texts) or "License files not found.")
+        text.configure(state="disabled")
 
     def repair(self):
         fn = getattr(self.core, "install_camera", None)
