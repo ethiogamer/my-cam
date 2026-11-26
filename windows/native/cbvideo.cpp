@@ -4,6 +4,7 @@
 // then converts NV12 -> BGR24 (scaled, letterboxed) on all CPU cores.
 // Plain C exports so Python can call it with ctypes.
 
+#define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mfapi.h>
@@ -405,6 +406,7 @@ __declspec(dllexport) void cb_destroy(void* handle) {
     delete d;
 }
 
+}  // extern "C"
 
 // ============================================================================
 // MP4 recorder: BGR24 frames + 16-bit PCM audio -> H.264 + AAC .mp4
