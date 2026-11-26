@@ -1,0 +1,39 @@
+name: AkremCam
+options:
+  bundleIdPrefix: com.akrem
+  deploymentTarget:
+    iOS: "15.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  AkremCam:
+    type: application
+    platform: iOS
+    sources:
+      - AkremCam
+    info:
+      path: AkremCam/Info.plist
+      properties:
+        CFBundleDisplayName: Akrem Cam
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+        NSCameraUsageDescription: Akrem Cam uses the camera to send live video to your PC as a webcam.
+        NSLocalNetworkUsageDescription: Akrem Cam sends video to your PC over the USB cable.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.akrem.cam
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""

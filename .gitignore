@@ -1,0 +1,9 @@
+ios/build/
+ios/*.xcodeproj/
+ios/Payload/
+*.ipa
+windows/build/
+windows/dist/
+windows/bin/
+windows/*.spec
+__pycache__/

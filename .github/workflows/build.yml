@@ -1,0 +1,148 @@
+name: Build Akrem Cam
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SOFTCAM_COMMIT: fa38d892bd931b761588f9b7641ba49f006953f0
+
+jobs:
+  iphone:
+    name: iPhone app (.ipa)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build (unsigned — Sideloadly signs it)
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project AkremCam.xcodeproj \
+            -scheme AkremCam \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build | tail -n 60
+
+      - name: Package .ipa
+        working-directory: ios
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/AkremCam.app Payload/
+          zip -qr AkremCam.ipa Payload
+          ls -la AkremCam.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AkremCam-iPhone
+          path: ios/AkremCam.ipa
+
+  windows:
+    name: Windows app (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get Softcam (virtual webcam library)
+        shell: bash
+        run: |
+          git clone https://github.com/tshino/softcam.git ext/softcam
+          cd ext/softcam && git checkout "$SOFTCAM_COMMIT"
+
+      - name: Rename the camera to "Akrem Cam"
+        shell: pwsh
+        run: |
+          $f = "ext/softcam/src/softcam/softcam.cpp"
+          $s = Get-Content $f -Raw
+          $s = $s.Replace('L"DirectShow Softcam"', 'L"Akrem Cam"')
+          $s = $s.Replace('0xaef3b972, 0x5fa5, 0x4647, 0x95, 0x71, 0x35, 0x8e, 0xb4, 0x72, 0xbc, 0x9e',
+                          '0x58ea431c, 0x1871, 0x4d1e, 0xb6, 0x0c, 0x5e, 0xa9, 0x92, 0xf2, 0x66, 0x70')
+          if (-not $s.Contains('L"Akrem Cam"')) { throw "name patch failed" }
+          if (-not $s.Contains('0x58ea431c')) { throw "id patch failed" }
+          Set-Content $f $s -NoNewline
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build camera driver (64-bit and 32-bit)
+        working-directory: ext/softcam
+        run: |
+          nuget restore softcam.sln
+          msbuild softcam.sln /m /t:softcam /p:Configuration=Release /p:Platform=x64
+          msbuild softcam.sln /m /t:softcam /p:Configuration=Release /p:Platform=Win32
+
+      - name: Collect driver files
+        shell: bash
+        run: |
+          mkdir -p windows/bin
+          cp ext/softcam/x64/Release/softcam.dll windows/bin/akremcam64.dll
+          cp ext/softcam/Win32/Release/softcam.dll windows/bin/akremcam32.dll
+          ls -la windows/bin
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python tools
+        run: python -m pip install pillow pyinstaller
+
+      - name: Self-test (source)
+        working-directory: windows
+        run: python akremcam.py --selftest
+
+      - name: Build AkremCam.exe
+        working-directory: windows
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name AkremCam
+          --icon icon.ico
+          --add-data "icon.ico;."
+          --add-binary "bin/akremcam64.dll;."
+          --add-binary "bin/akremcam32.dll;."
+          akremcam.py
+
+      - name: Self-test (finished .exe)
+        working-directory: windows
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist/AkremCam.exe -ArgumentList "--selftest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "exe self-test failed: $($p.ExitCode)" }
+          Get-Item dist/AkremCam.exe | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AkremCam-Windows
+          path: windows/dist/AkremCam.exe
+
+  release:
+    name: Publish downloads
+    needs: [iphone, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+
+      - name: Update the "latest" release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release delete latest --repo "$REPO" --yes --cleanup-tag || true
+          gh release create latest --repo "$REPO" \
+            --title "Akrem Cam (latest)" \
+            --notes "AkremCam.ipa → install on the iPhone with Sideloadly. AkremCam.exe → run on Windows. Built from ${GITHUB_SHA::7}." \
+            out/AkremCam-iPhone/AkremCam.ipa out/AkremCam-Windows/AkremCam.exe
