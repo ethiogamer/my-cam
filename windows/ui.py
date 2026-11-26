@@ -34,7 +34,8 @@ PROFILES = {
     "Meeting · 720p 30fps": ("720p", "720p", 30),
     "HD · 1080p 30fps": ("1080p", "1080p", 30),
     "Smooth · 1080p 60fps": ("1080p", "1080p", 60),
-    "Fast · 720p 60fps": ("720p", "720p", 60),
+    "4K · 30fps": ("4K", "4K", 30),
+    "4K · 60fps (OBS / recording)": ("4K", "4K", 60),
 }
 
 
@@ -166,27 +167,65 @@ class Switch(tk.Frame):
         c.create_oval(x + 2, 3, x + 14, 15, fill=knob, outline=knob)
 
 
-class Slider(tk.Frame):
-    """Label + value on one line, slider underneath."""
+GRADIENTS = {
+    "temperature": ["#3b82f6", "#e5e7eb", "#facc15"],
+    "warmth": ["#3b82f6", "#e5e7eb", "#facc15"],
+    "tint": ["#22c55e", "#e5e7eb", "#d946ef"],
+    "hue": ["#ef4444", "#f59e0b", "#22c55e", "#06b6d4", "#3b82f6", "#a855f7", "#ef4444"],
+    "saturation": ["#6b7280", "#ef4444"],
+    "vibrance": ["#6b7280", "#f97316"],
+    "brightness": ["#111111", "#f5f5f5"],
+    "exposure": ["#111111", "#f5f5f5"],
+    "gamma": ["#facc15", "#1f2937"],
+    "contrast": ["#6b7280", "#111111"],
+}
 
-    def __init__(self, parent, text, lo, hi, value, fmt, command, bg=None):
+
+def _mix(c1, c2, t):
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+class Slider(tk.Frame):
+    """Label + value on one line, a drawn slider underneath (optionally with a colour track)."""
+
+    H = 22
+
+    def __init__(self, parent, text, lo, hi, value, fmt, command, bg=None, colors=None, default=None):
         bg = bg or C["card"]
         super().__init__(parent, bg=bg)
         self.fmt = fmt
         self.command = command
+        self.lo, self.hi = float(lo), float(hi)
+        self.colors = colors
+        self.default = value if default is None else default
+        self.enabled = True
         self.var = tk.DoubleVar(value=value)
         self._echo = None
         top = tk.Frame(self, bg=bg)
         top.pack(fill="x")
-        self.label = tk.Label(top, text=text, font=(FONT, 9), bg=bg, fg=C["dim"], anchor="w")
+        self.label = tk.Label(top, text=text, font=(FONT, 9), bg=bg, fg=C["dim"], anchor="w", cursor="hand2")
         self.label.pack(side="left")
+        self.label.bind("<Double-Button-1>", lambda e: self._set_user(self.default))
         self.value_label = tk.Label(top, font=(FONT, 9, "bold"), bg=bg, fg=C["fg"], anchor="e")
         self.value_label.pack(side="right")
-        self.scale = ttk.Scale(self, variable=self.var, from_=lo, to=hi, orient="horizontal",
-                               command=self._moved, style="CamBridge.Horizontal.TScale")
-        self.scale.pack(fill="x", pady=(1, 0))
-        self.var.trace_add("write", lambda *_: self.show())
+        self.canvas = tk.Canvas(self, height=self.H, bg=bg, highlightthickness=0, cursor="hand2")
+        self.canvas.pack(fill="x")
+        self.canvas.bind("<Configure>", lambda e: self.draw())
+        self.canvas.bind("<Button-1>", self._drag)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<Double-Button-1>", lambda e: self._set_user(self.default))
+        self.var.trace_add("write", lambda *_: (self.show(), self.draw()))
         self.show()
+
+    # Compatibility with the old ttk-based slider
+    @property
+    def scale(self):
+        return self
+
+    def configure_range(self, lo, hi):
+        self.set_range(lo, hi)
 
     def show(self):
         try:
@@ -194,26 +233,72 @@ class Slider(tk.Frame):
         except (tk.TclError, ValueError):
             pass
 
-    def _moved(self, value):
-        value = float(value)
-        if self._echo is not None and abs(value - self._echo) < 1e-9:
+    def _x_range(self):
+        w = max(40, self.canvas.winfo_width())
+        return 9, w - 9
+
+    def draw(self):
+        c = self.canvas
+        c.delete("all")
+        x0, x1 = self._x_range()
+        y = self.H // 2
+        span = max(1e-9, self.hi - self.lo)
+        t = (min(self.hi, max(self.lo, self.var.get())) - self.lo) / span
+        kx = x0 + t * (x1 - x0)
+        dim = not self.enabled
+        if self.colors:
+            stops = self.colors
+            steps = 48
+            for i in range(steps):
+                f = i / (steps - 1)
+                seg = f * (len(stops) - 1)
+                j = min(len(stops) - 2, int(seg))
+                color = _mix(stops[j], stops[j + 1], seg - j)
+                if dim:
+                    color = _mix(color, C["card"], 0.65)
+                xa = x0 + (x1 - x0) * i / steps
+                xb = x0 + (x1 - x0) * (i + 1) / steps + 1
+                c.create_rectangle(xa, y - 3, xb, y + 3, fill=color, outline="")
+        else:
+            c.create_rectangle(x0, y - 2, x1, y + 2, fill=C["line"], outline="")
+            if not dim:
+                zero = x0 + (min(self.hi, max(self.lo, 0.0)) - self.lo) / span * (x1 - x0) if self.lo < 0 < self.hi else x0
+                c.create_rectangle(min(zero, kx), y - 2, max(zero, kx), y + 2, fill=C["accent"], outline="")
+        knob = C["faint"] if dim else "#ffffff"
+        c.create_oval(kx - 8, y - 8, kx + 8, y + 8, fill=knob, outline=C["bg"], width=2)
+
+    def _drag(self, e):
+        if not self.enabled:
+            return
+        x0, x1 = self._x_range()
+        t = min(1.0, max(0.0, (e.x - x0) / max(1, x1 - x0)))
+        self._set_user(self.lo + t * (self.hi - self.lo))
+
+    def _set_user(self, value):
+        if not self.enabled:
             return
         self._echo = None
-        self.command(value)
+        self.var.set(value)
+        self.command(float(value))
 
     def set_quietly(self, value):
-        """Shows a value that came from the iPhone without sending it back."""
+        """Shows a value that came from the phone without sending it back."""
         if abs(self.var.get() - value) > 1e-6:
-            self._echo = value
             self.var.set(value)
 
     def set_range(self, lo, hi):
-        self.scale.configure(from_=lo, to=hi)
+        lo, hi = float(lo), float(hi)
+        if (lo, hi) != (self.lo, self.hi):
+            self.lo, self.hi = lo, hi
+            self.draw()
 
     def set_enabled(self, enabled):
-        self.scale.state(["!disabled"] if enabled else ["disabled"])
+        if enabled == self.enabled:
+            return
+        self.enabled = enabled
         self.label.configure(fg=C["dim"] if enabled else C["faint"])
         self.value_label.configure(fg=C["fg"] if enabled else C["faint"])
+        self.draw()
 
 
 def flat_button(parent, text, command, bg=None, fg=None, bold=False, padx=10, pady=4):
@@ -224,6 +309,19 @@ def flat_button(parent, text, command, bg=None, fg=None, bold=False, padx=10, pa
     b.bind("<Enter>", lambda e: b.configure(bg=C["hover"]) if b.cget("bg") == bg else None)
     b.bind("<Leave>", lambda e: b.configure(bg=bg) if b.cget("bg") == C["hover"] else None)
     return b
+
+
+def apply_priority(high):
+    """High performance mode: raise CamBridge's priority on Windows."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        HIGH, NORMAL = 0x00000080, 0x00000020
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(),
+                                                HIGH if high else NORMAL)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +358,7 @@ def start_tray(app, icon_path):
 # ---------------------------------------------------------------------------
 
 class App:
-    def __init__(self, root, settings, slot, link, pump, core=None, wifi=None, start_minimized=False):
+    def __init__(self, root, settings, slot, link, pump, core=None, wifi=None, audio=None, start_minimized=False):
         self.root = root
         self.settings = settings
         self.slot = slot
@@ -268,6 +366,8 @@ class App:
         self.pump = pump
         self.core = core or sys.modules.get("__main__")
         self.wifi = wifi
+        self.audio = audio
+        self._perf_tick = 0.0
         self.wifi_window = None
         self.qr_photo = None
         self.ui_queue = queue.Queue()
@@ -546,6 +646,10 @@ class App:
                                           lambda v: self.send("shutter", throttle=True,
                                                               shutter=self._pos_to_shutter(v))))
         self.shutter.pack(fill="x")
+        self.lowlight_var = tk.BooleanVar(value=True)
+        self.lowlight_sw = self._phone(Switch(exp, "Low light boost", self.lowlight_var,
+                                              lambda v: self.send("lowLight", lowLight=v)))
+        self.lowlight_sw.pack(fill="x", side="bottom", pady=(8, 0))
 
         foc = self._card(p, "Focus")
         self.focus_live = foc.live
@@ -571,11 +675,13 @@ class App:
         self.wb_seg.pack(fill="x", pady=(0, 8))
         self.wb_manual = tk.Frame(wb, bg=C["card"])
         self.temp = self._phone(Slider(self.wb_manual, "Temperature", 2500, 9000, 5000, lambda v: "%dK" % v,
-                                       lambda v: self.send("temperature", throttle=True, temperature=round(v))))
+                                       lambda v: self.send("temperature", throttle=True, temperature=round(v)),
+                                       colors=GRADIENTS["temperature"], default=5500))
         self.temp.pack(fill="x", pady=(0, 6))
         self.tint = self._phone(Slider(self.wb_manual, "Tint  (green ↔ magenta)", -100, 100, 0,
                                        lambda v: "%+d" % v,
-                                       lambda v: self.send("tint", throttle=True, tint=round(v))))
+                                       lambda v: self.send("tint", throttle=True, tint=round(v)),
+                                       colors=GRADIENTS["tint"], default=0))
         self.tint.pack(fill="x")
 
         light = self._card(p, "Light")
@@ -592,12 +698,27 @@ class App:
         opt = self._card(p, "Video from phone")
         tk.Label(opt, text="Quality", font=(FONT, 9), bg=C["card"], fg=C["dim"], anchor="w").pack(fill="x")
         self.quality_var = tk.StringVar(value="1080p")
-        self._phone(Segmented(opt, [("720p", "720p"), ("1080p", "1080p")], self.quality_var,
-                              lambda v: self.send("quality", quality=v))).pack(fill="x", pady=(2, 8))
+        self.quality_seg = self._phone(Segmented(opt, [("720p", "720p"), ("1080p", "1080p"), ("4K", "4K")],
+                                                 self.quality_var, lambda v: self.send("quality", quality=v)))
+        self.quality_seg.pack(fill="x", pady=(2, 8))
         tk.Label(opt, text="Frame rate", font=(FONT, 9), bg=C["card"], fg=C["dim"], anchor="w").pack(fill="x")
         self.fps_var = tk.StringVar(value="30")
         self._phone(Segmented(opt, [("30", "30 fps"), ("60", "60 fps")], self.fps_var,
                               lambda v: self.send("fps", fps=int(v)))).pack(fill="x", pady=(2, 8))
+        tk.Label(opt, text="Video format", font=(FONT, 9), bg=C["card"], fg=C["dim"], anchor="w").pack(fill="x")
+        self.codec_var = tk.StringVar(value="h264")
+        self.codec_seg = self._phone(Segmented(opt, [("h264", "H.264"), ("hevc", "HEVC"), ("jpeg", "JPEG")],
+                                               self.codec_var, lambda v: self.send("codec", codec=v)))
+        self.codec_seg.pack(fill="x", pady=(2, 2))
+        tk.Label(opt, text="H.264: best for 4K 60 and low delay. HEVC: same quality with less data "
+                           "(needs Windows' HEVC extension). JPEG: simplest, uses more data.",
+                 font=(FONT, 8), bg=C["card"], fg=C["faint"], justify="left", anchor="w",
+                 wraplength=SIDE_W - 50).pack(fill="x", pady=(0, 8))
+        tk.Label(opt, text="Bitrate (picture detail)", font=(FONT, 9), bg=C["card"], fg=C["dim"],
+                 anchor="w").pack(fill="x")
+        self.bitrate_var = tk.StringVar(value="auto")
+        self._phone(Segmented(opt, [("auto", "Auto"), ("low", "Low"), ("high", "High"), ("max", "Max")],
+                              self.bitrate_var, lambda v: self.send("bitrate", bitrate=v))).pack(fill="x", pady=(2, 8))
         tk.Label(opt, text="Phone orientation", font=(FONT, 9), bg=C["card"], fg=C["dim"],
                  anchor="w").pack(fill="x")
         self.orient_var = tk.StringVar(value="Auto")
@@ -642,6 +763,9 @@ class App:
             "stabilization": lambda v: self.stab_var.set(bool(v)),
             "hdr": lambda v: self.hdr_var.set(bool(v)),
             "screenOff": lambda v: self.dark_var.set(bool(v)),
+            "codec": lambda v: self.codec_var.set(v),
+            "bitrate": lambda v: self.bitrate_var.set(v),
+            "lowLight": lambda v: self.lowlight_var.set(bool(v)),
         }
         self._show_modes()
 
@@ -701,12 +825,20 @@ class App:
         adj = self._card(p, "Adjust")
         a = self.settings["adjust"]
         self.adjust_sliders = {}
-        for key, label in (("brightness", "Brightness"), ("contrast", "Contrast"),
-                           ("saturation", "Saturation"), ("warmth", "Warmth"), ("tint", "Tint")):
-            s = Slider(adj, label, -100, 100, a.get(key, 0), lambda v: "%+d" % round(v),
-                       lambda v, k=key: self.set_adjust(k, v))
+        for key, label, lo, hi in (("brightness", "Brightness", -100, 100), ("contrast", "Contrast", -100, 100),
+                                   ("saturation", "Saturation", -100, 100), ("vibrance", "Vibrance", -100, 100),
+                                   ("warmth", "Warmth", -100, 100), ("tint", "Tint", -100, 100),
+                                   ("hue", "Hue", -180, 180), ("gamma", "Gamma", -100, 100),
+                                   ("sharpness", "Sharpness", 0, 100),
+                                   ("backlight", "Backlight compensation", 0, 100)):
+            fmt = (lambda v: "%+d°" % round(v)) if key == "hue" else (
+                (lambda v: "%d" % round(v)) if lo == 0 else (lambda v: "%+d" % round(v)))
+            s = Slider(adj, label, lo, hi, a.get(key, 0), fmt, lambda v, k=key: self.set_adjust(k, v),
+                       colors=GRADIENTS.get(key), default=0)
             s.pack(fill="x", pady=(0, 6))
             self.adjust_sliders[key] = s
+        tk.Label(adj, text="Tip: double-click a slider to reset it.", font=(FONT, 8), bg=C["card"],
+                 fg=C["faint"], anchor="w").pack(fill="x")
         flat_button(adj, "Reset", self.reset_adjust).pack(anchor="w", pady=(2, 0))
 
         fr = self._card(p, "Framing", "drag preview to move")
@@ -740,8 +872,14 @@ class App:
         tk.Label(out, text="Size that apps receive", font=(FONT, 9), bg=C["card"], fg=C["dim"],
                  anchor="w").pack(fill="x")
         self.output_var = tk.StringVar(value=self.settings["output"])
-        Segmented(out, [("720p", "720p"), ("1080p", "1080p")], self.output_var,
-                  self.set_output).pack(fill="x", pady=(2, 0))
+        Segmented(out, [("720p", "720p"), ("1080p", "1080p"), ("1440p", "1440p"), ("4K", "4K")],
+                  self.output_var, self.set_output).pack(fill="x", pady=(2, 0))
+        tk.Label(out, text="Zoom, Teams and Meet send at most 1080p. Use 4K for OBS and recordings.",
+                 font=(FONT, 8), bg=C["card"], fg=C["faint"], justify="left", anchor="w",
+                 wraplength=SIDE_W - 50).pack(fill="x", pady=(4, 0))
+
+        self._build_sound(p)
+        self._build_performance(p)
 
         app = self._card(p, "App")
         self.autostart_var = tk.BooleanVar(value=self._core("autostart_enabled", False))
@@ -758,6 +896,153 @@ class App:
         tk.Label(app, text="CamBridge %s · free to use · © 2026 ethiogamer" % self._core("VERSION", ""), font=(FONT, 8), bg=C["card"],
                  fg=C["faint"], anchor="w").pack(fill="x", pady=(8, 0))
         self._gap(p, 10)
+
+    # ---- sound ----------------------------------------------------------------
+
+    def _audio_sources(self):
+        import audio as audiomod
+        choices = [("none", "No sound"), ("phone", "Phone microphone")]
+        choices += [("pc:" + n, "PC: " + n) for n in audiomod.list_devices("input")]
+        return choices
+
+    def _build_sound(self, p):
+        import audio as audiomod
+        self._section_title(p, "Sound")
+        mic = self._card(p, "Microphone")
+        self.source_choices = self._audio_sources()
+        current = self.audio.source if self.audio else "none"
+        labels = [label for _, label in self.source_choices]
+        self.source_var = tk.StringVar(value=dict(self.source_choices).get(current, "No sound"))
+        row = tk.Frame(mic, bg=C["card"])
+        row.pack(fill="x")
+        self.source_box = ttk.Combobox(row, textvariable=self.source_var, values=labels, state="readonly",
+                                       style="CamBridge.TCombobox")
+        self.source_box.pack(side="left", fill="x", expand=True)
+        self.source_box.bind("<<ComboboxSelected>>", lambda e: self.set_audio_source())
+        flat_button(row, "↻", self.refresh_audio_devices, padx=8).pack(side="left", padx=(6, 0))
+
+        self.meter = tk.Canvas(mic, height=10, bg=C["card"], highlightthickness=0)
+        self.meter.pack(fill="x", pady=(8, 6))
+        self.audio_note = tk.Label(mic, text="", font=(FONT, 8), bg=C["card"], fg=C["faint"], anchor="w",
+                                   justify="left", wraplength=SIDE_W - 50)
+        self.audio_note.pack(fill="x")
+        fx = self.settings["audio_fx"]
+        Slider(mic, "Volume", -20, 20, fx.get("gain_db", 0.0), lambda v: "%+d dB" % round(v),
+               lambda v: self.audio and self.audio.set_effect("gain_db", round(v, 1)), default=0).pack(fill="x", pady=(4, 6))
+        self.mute_var = tk.BooleanVar(value=False)
+        Switch(mic, "Mute", self.mute_var, lambda v: setattr(self.audio, "muted", bool(v))).pack(fill="x", pady=2)
+        for key, text in (("limiter", "Limiter (no distortion on loud sounds)"),
+                          ("gate", "Noise gate (silence between words)"),
+                          ("clarity", "Voice clarity (removes low rumble)")):
+            var = tk.BooleanVar(value=bool(fx.get(key, key == "limiter")))
+            Switch(mic, text, var, lambda v, k=key: self.audio and self.audio.set_effect(k, bool(v))).pack(fill="x", pady=2)
+            setattr(self, "fx_%s_var" % key, var)
+        tk.Label(mic, text="Sound is saved in recordings. For calls, your PC mic can be picked directly in "
+                           "Zoom / Telegram.", font=(FONT, 8), bg=C["card"], fg=C["faint"], justify="left",
+                 anchor="w", wraplength=SIDE_W - 50).pack(fill="x", pady=(6, 0))
+
+        call = self._card(p, "Use this sound in calls")
+        outputs = ["Off"] + audiomod.list_devices("output")
+        self.send_var = tk.StringVar(value=(self.audio.send_to if self.audio and self.audio.send_to else "Off"))
+        self.send_box = ttk.Combobox(call, textvariable=self.send_var, values=outputs, state="readonly",
+                                     style="CamBridge.TCombobox")
+        self.send_box.pack(fill="x")
+        self.send_box.bind("<<ComboboxSelected>>", lambda e: self.audio and self.audio.set_send_to(
+            "" if self.send_var.get() == "Off" else self.send_var.get()))
+        tk.Label(call, text="To use the phone mic in Zoom / Telegram: install the free VB-CABLE "
+                            "(vb-audio.com), choose “CABLE Input” here, then pick “CABLE Output” as the "
+                            "microphone in the call app.", font=(FONT, 8), bg=C["card"], fg=C["faint"],
+                 justify="left", anchor="w", wraplength=SIDE_W - 50).pack(fill="x", pady=(6, 0))
+
+    def set_audio_source(self):
+        label = self.source_var.get()
+        for value, text in self.source_choices:
+            if text == label and self.audio:
+                self.audio.set_source(value)
+                self.show_toast("Sound: " + text)
+
+    def refresh_audio_devices(self):
+        import audio as audiomod
+        self.source_choices = self._audio_sources()
+        self.source_box.configure(values=[label for _, label in self.source_choices])
+        self.send_box.configure(values=["Off"] + audiomod.list_devices("output"))
+        self.show_toast("Sound devices refreshed")
+
+    def _update_sound(self):
+        if not self.audio:
+            return
+        hub = self.audio
+        self.meter.delete("all")
+        w = max(20, self.meter.winfo_width())
+        level = hub.level if hub.active() else 0.0
+        hub.level *= 0.8
+        self.meter.create_rectangle(0, 2, w, 8, fill=C["line"], outline="")
+        if level > 0.001:
+            color = C["green"] if level < 0.7 else (C["orange"] if level < 0.92 else C["red"])
+            self.meter.create_rectangle(0, 2, int(w * min(1.0, level)), 8, fill=color, outline="")
+        if hub.error:
+            note = hub.error
+        elif hub.source == "none":
+            note = "Recordings will have no sound."
+        elif hub.active():
+            note = "%s · %d Hz %s" % ("Phone mic" if hub.source == "phone" else "PC mic", hub.rate,
+                                      "stereo" if hub.channels == 2 else "mono")
+        elif hub.source == "phone":
+            note = "Waiting for sound from the phone…"
+        else:
+            note = "Waiting for the microphone…"
+        self.audio_note.configure(text=note)
+
+    # ---- performance ------------------------------------------------------------
+
+    def _build_performance(self, p):
+        card = self._card(p, "Performance")
+        self.perf_info = tk.Label(card, text="", font=(FONT, 9), bg=C["card"], fg=C["fg"], anchor="w",
+                                  justify="left", wraplength=SIDE_W - 50)
+        self.perf_info.pack(fill="x")
+        self.perf_stats = tk.Label(card, text="", font=("Consolas", 8), bg=C["card"], fg=C["dim"], anchor="w",
+                                   justify="left")
+        self.perf_stats.pack(fill="x", pady=(6, 8))
+        self.highperf_var = tk.BooleanVar(value=self.settings["high_performance"])
+        Switch(card, "High performance mode", self.highperf_var, self.set_high_performance).pack(fill="x", pady=2)
+        tk.Label(card, text="Gives CamBridge priority over other programs. Use it for 4K 60 or when "
+                            "games / streaming software run at the same time.", font=(FONT, 8), bg=C["card"],
+                 fg=C["faint"], justify="left", anchor="w", wraplength=SIDE_W - 50).pack(fill="x")
+        self.adaptive_var = tk.BooleanVar(value=self.settings["adaptive"])
+        self._phone(Switch(card, "Keep it smooth (lower detail when the link is busy)", self.adaptive_var,
+                           self.set_adaptive)).pack(fill="x", pady=(6, 2))
+        apply_priority(self.settings["high_performance"])
+
+    def set_high_performance(self, on):
+        self.settings["high_performance"] = bool(on)
+        self.settings.save()
+        apply_priority(on)
+        self.show_toast("High performance mode " + ("on" if on else "off"))
+
+    def set_adaptive(self, on):
+        self.settings["adaptive"] = bool(on)
+        self.settings.save()
+        self.link.on_connect = dict(getattr(self.link, "on_connect", {}), adaptive=bool(on))
+        self.send("adaptive", adaptive=bool(on))
+
+    def _update_performance(self):
+        pump = self.pump
+        st = pump.stats
+        cores = os.cpu_count() or 1
+        self.perf_info.configure(text="Decoding: %s · %s\nProcessing: %d CPU threads%s" % (
+            getattr(pump, "decoder_name", "—"), getattr(pump, "codec", "—"), cores,
+            " · high priority" if self.settings["high_performance"] else ""))
+        w, h = pump.size
+        lines = [
+            "Incoming   %6.1f Mbit/s" % st.mbps,
+            "Output     %dx%d @ %d fps" % (w, h, pump.fps),
+            "Decode     %6.1f ms" % st.decode_ms,
+            "Effects    %6.1f ms" % st.process_ms,
+            "Dropped    %6d frames" % st.dropped,
+        ]
+        if self.pump.recorder is not None and getattr(self.pump.recorder, "dropped", 0):
+            lines.append("Rec drops  %6d frames" % self.pump.recorder.dropped)
+        self.perf_stats.configure(text="\n".join(lines))
 
     def _core(self, name, default):
         value = getattr(self.core, name, default)
@@ -960,7 +1245,7 @@ class App:
             rec = self.pump.recorder
             self.pump.stop_recording()
             folder = os.path.dirname(rec.path) if rec else recorder.recordings_dir()
-            self.show_toast("Recording saved — click to open folder", 12, self.open_recordings)
+            self.show_toast("Recording saved (MP4) — click to open folder", 12, self.open_recordings)
             self._last_record_folder = folder
 
     # ---- window / tray -----------------------------------------------------------
@@ -1194,6 +1479,10 @@ class App:
             self.toast_action = None
             self.toast_until = 0
 
+        self._update_sound()
+        if time.monotonic() - self._perf_tick > 0.5:
+            self._perf_tick = time.monotonic()
+            self._update_performance()
         self._render_preview()
         self.root.after(50, self._tick)
 

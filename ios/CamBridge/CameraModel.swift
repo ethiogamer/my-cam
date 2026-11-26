@@ -26,9 +26,48 @@ enum Lens: String, CaseIterable, Identifiable {
 enum VideoQuality: String, CaseIterable, Identifiable {
     case hd720 = "720p"
     case hd1080 = "1080p"
+    case uhd4K = "4K"
     var id: String { rawValue }
-    var preset: AVCaptureSession.Preset { self == .hd720 ? .hd1280x720 : .hd1920x1080 }
-    var size: (width: Int32, height: Int32) { self == .hd720 ? (1280, 720) : (1920, 1080) }
+    var preset: AVCaptureSession.Preset {
+        switch self {
+        case .hd720: return .hd1280x720
+        case .hd1080: return .hd1920x1080
+        case .uhd4K: return .hd4K3840x2160
+        }
+    }
+    var size: (width: Int32, height: Int32) {
+        switch self {
+        case .hd720: return (1280, 720)
+        case .hd1080: return (1920, 1080)
+        case .uhd4K: return (3840, 2160)
+        }
+    }
+}
+
+enum StreamCodec: String, CaseIterable, Identifiable {
+    case h264, hevc, jpeg
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .h264: return "H.264"
+        case .hevc: return "HEVC"
+        case .jpeg: return "JPEG"
+        }
+    }
+}
+
+enum BitrateLevel: String, CaseIterable, Identifiable {
+    case auto, low, high, max
+    var id: String { rawValue }
+    var label: String { rawValue.prefix(1).uppercased() + rawValue.dropFirst() }
+    var factor: Double {
+        switch self {
+        case .low: return 0.5
+        case .auto: return 1.0
+        case .high: return 1.6
+        case .max: return 2.5
+        }
+    }
 }
 
 enum FrameRate: Int, CaseIterable, Identifiable {
@@ -63,6 +102,18 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var orientationMode: OrientationMode = .auto {
         didSet { guard orientationMode != oldValue else { return }; save(); updateOrientationFromDevice() }
     }
+    @Published var codec: StreamCodec = .h264 {
+        didSet { guard codec != oldValue else { return }; save(); updateEncoder(); videoEncoder.requestKeyframe(); sendInfo() }
+    }
+    @Published var bitrateLevel: BitrateLevel = .auto {
+        didSet { guard bitrateLevel != oldValue else { return }; save(); updateEncoder(); sendInfo() }
+    }
+    @Published var lowLight = true {
+        didSet { guard lowLight != oldValue else { return }; save(); applyLowLight(); sendInfo() }
+    }
+    /// The PC asked for the microphone.
+    @Published private(set) var audioEnabled = false
+    @Published private(set) var micDenied = false
     @Published var mirror = false {
         didSet {
             guard mirror != oldValue else { return }
@@ -179,11 +230,20 @@ final class CameraModel: NSObject, ObservableObject {
     private let videoOutput = AVCaptureVideoDataOutput()
     private var videoInput: AVCaptureDeviceInput?
     private let encoder = JPEGEncoder()
+    private let videoEncoder = VideoEncoder()
+    private let audioOutput = AVCaptureAudioDataOutput()
+    private var audioInput: AVCaptureDeviceInput?
+    private let audioQueue = DispatchQueue(label: "cambridge.audio")
+    private var adaptive = true
+    private var adaptiveScale = 1.0
+    private var lastCongestion = Date.distantPast
+    private var streamCodecForFrames: StreamCodec = .h264
     private var started = false
     private var fpsTimer: Timer?
     private var savedBrightness: CGFloat = 0.5
     private var currentVideoOrientation: AVCaptureVideoOrientation = .landscapeRight
     private var mirrorForSession = false
+    private var lowLightForSession = true
     private var stabilizationForSession = false
     private var liveTimer: Timer?
     private var pinchStartZoom: CGFloat = 1.0
@@ -231,6 +291,11 @@ final class CameraModel: NSObject, ObservableObject {
         server.onCommand = { [weak self] command in
             DispatchQueue.main.async { self?.handle(command: command) }
         }
+        server.onNeedKeyframe = { [weak self] in self?.videoEncoder.requestKeyframe() }
+        server.onCongestion = { [weak self] in
+            DispatchQueue.main.async { self?.congested() }
+        }
+        videoEncoder.onFallback = { [weak self] _ in self?.codec = .h264 }
         server.start()
         wifi.start(server: server)
 
@@ -238,6 +303,7 @@ final class CameraModel: NSObject, ObservableObject {
             guard let self = self else { return }
             self.fps = self.server.takeSentFrameCount()
             self.readLiveValues()
+            self.recoverBitrate()
         }
 
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -315,6 +381,12 @@ final class CameraModel: NSObject, ObservableObject {
         if let v = c["screenOff"] as? Bool { screenOff = v }
         if c["focusCenter"] != nil { focus(at: CGPoint(x: 0.5, y: 0.5)) }
         if c["getInfo"] != nil { sendInfo() }
+        if let v = c["codec"] as? String, let cd = StreamCodec(rawValue: v) { codec = cd }
+        if let v = c["bitrate"] as? String, let b = BitrateLevel(rawValue: v) { bitrateLevel = b }
+        if let v = c["lowLight"] as? Bool { lowLight = v }
+        if let v = c["adaptive"] as? Bool { adaptive = v; if !v { adaptiveScale = 1.0; updateEncoder() } }
+        if let v = c["audio"] as? Bool { setAudio(v) }
+        if c["keyframe"] != nil { videoEncoder.requestKeyframe() }
     }
 
     // MARK: - Camera configuration
@@ -460,6 +532,9 @@ final class CameraModel: NSObject, ObservableObject {
             self.applyWhiteBalance()
             self.applyHDR()
             self.applyTorch()
+            self.applyLowLight()
+            self.updateEncoder()
+            self.videoEncoder.requestKeyframe()
             self.sendInfo()
         }
     }
@@ -475,7 +550,7 @@ final class CameraModel: NSObject, ObservableObject {
             device.whiteBalanceMode = .continuousAutoWhiteBalance
         }
         if device.isLowLightBoostSupported {
-            device.automaticallyEnablesLowLightBoostWhenAvailable = true
+            device.automaticallyEnablesLowLightBoostWhenAvailable = lowLightForSession
         }
     }
 
@@ -587,6 +662,140 @@ final class CameraModel: NSObject, ObservableObject {
                 device.torchMode = .off
             }
         }
+    }
+
+    private func applyLowLight() {
+        lowLightForSession = lowLight
+        let on = lowLight
+        withDevice { device in
+            if device.isLowLightBoostSupported {
+                device.automaticallyEnablesLowLightBoostWhenAvailable = on
+            }
+        }
+    }
+
+    // MARK: - Video encoding settings
+
+    /// Bits per second for the current size / frame rate / level.
+    private func targetBitrate() -> Int {
+        let h = lastHeight > 0 ? min(lastWidth, lastHeight) : Int(quality.size.height)
+        let base: Double = h <= 720 ? 6_000_000 : (h <= 1080 ? 12_000_000 : 35_000_000)
+        var rate = base * (actualFrameRate > 30 ? 1.5 : 1.0) * bitrateLevel.factor
+        if codec == .hevc { rate *= 0.7 }
+        if adaptive { rate *= adaptiveScale }
+        return Int(rate)
+    }
+
+    private func updateEncoder() {
+        streamCodecForFrames = codec
+        guard codec != .jpeg else { return }
+        videoEncoder.configure(codec: codec == .hevc ? .hevc : .h264, fps: actualFrameRate, bitrate: targetBitrate())
+    }
+
+    /// "Keep it smooth": the link is busy, so send less detail for a while.
+    private func congested() {
+        guard adaptive else { return }
+        lastCongestion = Date()
+        adaptiveScale = max(0.3, adaptiveScale * 0.75)
+        updateEncoder()
+    }
+
+    private func recoverBitrate() {
+        guard adaptive, adaptiveScale < 1.0, Date().timeIntervalSince(lastCongestion) > 3 else { return }
+        adaptiveScale = min(1.0, adaptiveScale * 1.1)
+        updateEncoder()
+    }
+
+    // MARK: - Microphone (only when the PC asks for it)
+
+    private func setAudio(_ on: Bool) {
+        guard on != audioEnabled else { return }
+        if on {
+            switch AVCaptureDevice.authorizationStatus(for: .audio) {
+            case .authorized:
+                break
+            case .notDetermined:
+                AVCaptureDevice.requestAccess(for: .audio) { granted in
+                    DispatchQueue.main.async {
+                        if granted { self.setAudio(true) } else { self.micDenied = true; self.sendInfo() }
+                    }
+                }
+                return
+            default:
+                micDenied = true
+                sendInfo()
+                return
+            }
+        }
+        audioEnabled = on
+        sessionQueue.async {
+            self.session.beginConfiguration()
+            if on {
+                if self.audioInput == nil, let mic = AVCaptureDevice.default(for: .audio),
+                   let input = try? AVCaptureDeviceInput(device: mic), self.session.canAddInput(input) {
+                    self.session.addInput(input)
+                    self.audioInput = input
+                }
+                if !self.session.outputs.contains(self.audioOutput), self.session.canAddOutput(self.audioOutput) {
+                    self.audioOutput.setSampleBufferDelegate(self, queue: self.audioQueue)
+                    self.session.addOutput(self.audioOutput)
+                }
+            } else {
+                if let input = self.audioInput {
+                    self.session.removeInput(input)
+                    self.audioInput = nil
+                }
+                if self.session.outputs.contains(self.audioOutput) {
+                    self.session.removeOutput(self.audioOutput)
+                }
+            }
+            self.session.commitConfiguration()
+        }
+        sendInfo()
+    }
+
+    /// Microphone samples -> 16-bit PCM message for the PC.
+    fileprivate func handleAudio(_ sampleBuffer: CMSampleBuffer) {
+        guard let fd = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(fd),
+              let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        let asbd = asbdPtr.pointee
+        let length = CMBlockBufferGetDataLength(block)
+        guard length > 0 else { return }
+        var raw = [UInt8](repeating: 0, count: length)
+        guard CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: &raw) == kCMBlockBufferNoErr else { return }
+        let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        let nonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+        var channels = Int(max(1, asbd.mChannelsPerFrame))
+        var pcm = Data()
+        if isFloat && asbd.mBitsPerChannel == 32 {
+            let count = length / 4
+            let usable = nonInterleaved ? count / channels : count
+            if nonInterleaved { channels = 1 }
+            pcm.reserveCapacity(usable * 2)
+            raw.withUnsafeBytes { buf in
+                let f = buf.bindMemory(to: Float32.self)
+                for i in 0..<usable {
+                    let v = Int16(max(-1, min(1, f[i])) * 32767)
+                    withUnsafeBytes(of: v.littleEndian) { pcm.append(contentsOf: $0) }
+                }
+            }
+        } else if asbd.mBitsPerChannel == 16 {
+            if nonInterleaved && channels > 1 {
+                pcm = Data(raw[0..<(length / channels)])
+                channels = 1
+            } else {
+                pcm = Data(raw)
+            }
+        } else {
+            return
+        }
+        var payload = Data()
+        let rate = UInt32(asbd.mSampleRate)
+        payload.append(contentsOf: [UInt8(rate >> 24 & 0xFF), UInt8(rate >> 16 & 0xFF), UInt8(rate >> 8 & 0xFF), UInt8(rate & 0xFF)])
+        payload.append(UInt8(min(2, channels)))
+        payload.append(pcm)
+        server.sendAudio(payload)
     }
 
     /// Reads what the camera is doing right now (ISO, shutter, focus, colour) for display.
@@ -742,6 +951,13 @@ final class CameraModel: NSObject, ObservableObject {
             "liveLens": Double(liveLens),
             "liveTemperature": Double(liveTemperature),
             "liveTint": Double(liveTint),
+            "codec": codec.rawValue,
+            "codecs": StreamCodec.allCases.map { $0.rawValue },
+            "bitrate": bitrateLevel.rawValue,
+            "bitrateMbps": Double(targetBitrate()) / 1_000_000,
+            "lowLight": lowLight,
+            "audio": audioEnabled,
+            "micDenied": micDenied,
         ]
         if lastWidth > 0 {
             info["width"] = lastWidth
@@ -761,6 +977,9 @@ final class CameraModel: NSObject, ObservableObject {
         d.set(orientationMode.rawValue, forKey: "orientation")
         d.set(mirror, forKey: "mirror")
         d.set(stabilization, forKey: "stabilization")
+        d.set(codec.rawValue, forKey: "codec")
+        d.set(bitrateLevel.rawValue, forKey: "bitrate")
+        d.set(lowLight, forKey: "lowLight")
         d.set(hdr, forKey: "hdr")
     }
 
@@ -773,6 +992,9 @@ final class CameraModel: NSObject, ObservableObject {
         if let v = d.string(forKey: "orientation"), let o = OrientationMode(rawValue: v) { orientationMode = o }
         mirror = d.bool(forKey: "mirror")
         stabilization = d.bool(forKey: "stabilization")
+        if let v = d.string(forKey: "codec"), let c = StreamCodec(rawValue: v) { codec = c }
+        if let v = d.string(forKey: "bitrate"), let b = BitrateLevel(rawValue: v) { bitrateLevel = b }
+        if d.object(forKey: "lowLight") != nil { lowLight = d.bool(forKey: "lowLight") }
         hdr = d.bool(forKey: "hdr")
     }
 }
@@ -798,11 +1020,36 @@ extension CameraModel: AVCaptureMetadataOutputObjectsDelegate {
 
 // MARK: - Frames
 
-extension CameraModel: AVCaptureVideoDataOutputSampleBufferDelegate {
+extension CameraModel: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
-        // Nothing to do if the PC isn't connected or is still receiving the last frame.
+        if output === audioOutput {
+            if server.isConnected { handleAudio(sampleBuffer) }
+            return
+        }
+        // Video (H.264 / HEVC): every frame is encoded; the link skips ahead if it falls behind.
+        if streamCodecForFrames != .jpeg {
+            guard server.isConnected, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            let w = CVPixelBufferGetWidth(pixelBuffer)
+            let h = CVPixelBufferGetHeight(pixelBuffer)
+            if w != lastWidth || h != lastHeight {
+                lastWidth = w
+                lastHeight = h
+                DispatchQueue.main.async { self.updateEncoder() }
+                sendInfo()
+            }
+            if ProcessInfo.processInfo.thermalState == .critical {
+                skipToggle.toggle()
+                if skipToggle { return }
+            }
+            let hevc = streamCodecForFrames == .hevc
+            videoEncoder.encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) { [weak self] data, key in
+                self?.server.sendVideo(data, hevc: hevc, keyframe: key)
+            }
+            return
+        }
+        // JPEG: nothing to do if the PC isn't connected or is still receiving the last frame.
         guard server.isReadyForFrame,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 

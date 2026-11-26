@@ -1,8 +1,15 @@
-"""Records video to .avi files (Motion-JPEG), which play in VLC, Windows Media Player,
-and open in video editors. A new file part starts automatically before 1.9 GB."""
+"""Recording.
 
+* Mp4Recorder: H.264 + AAC .mp4 using Windows' own encoders (cbvideo.dll) — the normal one.
+* AviRecorder: Motion-JPEG .avi without sound — fallback when the Windows encoder is missing.
+* RecordingWorker: runs the recorder on its own thread so recording never slows the webcam.
+"""
+
+import collections
+import ctypes
 import os
 import struct
+import threading
 import time
 
 _LIMIT = 1_900_000_000
@@ -102,3 +109,161 @@ class AviRecorder:
     def close(self):
         self._finish()
         return self.files
+
+
+# ---------------------------------------------------------------------------
+# MP4 (H.264 + AAC) through Windows Media Foundation
+# ---------------------------------------------------------------------------
+
+def _lib():
+    import video
+    if not video._NativeDecoder.available():
+        return None
+    lib = video._NativeDecoder._lib
+    if not getattr(lib, "_rec_ready", False):
+        lib.cb_rec_open.argtypes = [ctypes.c_wchar_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        lib.cb_rec_open.restype = ctypes.c_void_p
+        lib.cb_rec_audio_format.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+        lib.cb_rec_audio_format.restype = ctypes.c_int
+        lib.cb_rec_video.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_longlong]
+        lib.cb_rec_video.restype = ctypes.c_int
+        lib.cb_rec_audio.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong]
+        lib.cb_rec_audio.restype = ctypes.c_int
+        lib.cb_rec_close.argtypes = [ctypes.c_void_p]
+        lib.cb_rec_close.restype = ctypes.c_int
+        lib._rec_ready = True
+    return lib
+
+
+def mp4_available():
+    return _lib() is not None
+
+
+def bitrate_kbps(width, height, fps):
+    pixels = width * height
+    base = 8000 if pixels <= 1280 * 720 else 16000 if pixels <= 1920 * 1080 else 24000 if pixels <= 2560 * 1440 else 45000
+    return int(base * (1.5 if fps > 30 else 1.0))
+
+
+class Mp4Recorder:
+    def __init__(self, width, height, fps=30, audio_rate=0, audio_channels=0, folder=None):
+        self.lib = _lib()
+        if self.lib is None:
+            raise OSError("MP4 recording needs Windows")
+        self.width, self.height = width & ~1, height & ~1
+        self.folder = folder or recordings_dir()
+        self.started = time.monotonic()
+        path = os.path.join(self.folder, "CamBridge %s.mp4" % time.strftime("%Y-%m-%d %H-%M-%S"))
+        self.files = [path]
+        self.handle = self.lib.cb_rec_open(path, self.width, self.height, int(fps),
+                                           bitrate_kbps(width, height, fps), int(audio_rate), int(audio_channels))
+        if not self.handle:
+            raise OSError("could not start MP4 recording")
+        rate, ch = ctypes.c_int(), ctypes.c_int()
+        if self.lib.cb_rec_audio_format(self.handle, ctypes.byref(rate), ctypes.byref(ch)):
+            self.audio_rate, self.audio_channels = rate.value, ch.value
+        else:
+            self.audio_rate, self.audio_channels = 0, 0
+
+    @property
+    def path(self):
+        return self.files[-1]
+
+    def elapsed(self):
+        return time.monotonic() - self.started
+
+    def add_video(self, bgr, t):
+        self.lib.cb_rec_video(self.handle, bgr, int(t * 1e7))
+
+    def add_audio(self, pcm, frames, t):
+        if self.audio_rate:
+            self.lib.cb_rec_audio(self.handle, pcm, frames, int(t * 1e7))
+
+    def close(self):
+        if self.handle:
+            self.lib.cb_rec_close(self.handle)
+            self.handle = None
+        return self.files
+
+
+class RecordingWorker(threading.Thread):
+    """Feeds a recorder from its own thread. Video frames are dropped (never audio) if the
+    encoder falls behind, so recording can't make the webcam stutter."""
+
+    MAX_VIDEO = 3
+
+    def __init__(self, width, height, fps, audio_rate, audio_channels):
+        super().__init__(daemon=True)
+        self.width, self.height = width, height
+        self.error = None
+        try:
+            self.rec = Mp4Recorder(width, height, fps, audio_rate, audio_channels)
+            self.kind = "mp4"
+        except OSError:
+            self.rec = AviRecorder(width, height)   # fallback: no sound
+            self.kind = "avi"
+        self.audio_rate = getattr(self.rec, "audio_rate", 0)
+        self.audio_channels = getattr(self.rec, "audio_channels", 0)
+        self.items = collections.deque()
+        self.cond = threading.Condition()
+        self.running = True
+        self.dropped = 0
+        self.start()
+
+    @property
+    def path(self):
+        return self.rec.path
+
+    def elapsed(self):
+        return self.rec.elapsed()
+
+    def put_video(self, bgr_bytes, t):
+        with self.cond:
+            videos = sum(1 for i in self.items if i[0] == "v")
+            if videos >= self.MAX_VIDEO:
+                for i, item in enumerate(self.items):
+                    if item[0] == "v":
+                        del self.items[i]
+                        self.dropped += 1
+                        break
+            self.items.append(("v", bgr_bytes, t))
+            self.cond.notify()
+
+    def put_audio(self, pcm, frames, t):
+        if not self.audio_rate:
+            return
+        with self.cond:
+            self.items.append(("a", pcm, frames, t))
+            self.cond.notify()
+
+    def stop(self):
+        with self.cond:
+            self.running = False
+            self.cond.notify()
+        self.join(10)
+        return self.rec.close()
+
+    def run(self):
+        while True:
+            with self.cond:
+                while self.running and not self.items:
+                    self.cond.wait(0.5)
+                if not self.items and not self.running:
+                    return
+                item = self.items.popleft()
+            try:
+                if item[0] == "v":
+                    if self.kind == "mp4":
+                        self.rec.add_video(item[1], item[2])
+                    else:
+                        from PIL import Image
+                        import io
+                        img = Image.frombuffer("RGB", (self.width, self.height), item[1], "raw", "BGR", 0, 1)
+                        buf = io.BytesIO()
+                        img.save(buf, "JPEG", quality=85)
+                        self.rec.add_jpeg(buf.getvalue())
+                else:
+                    self.rec.add_audio(item[1], item[2], item[3])
+            except Exception as e:
+                self.error = str(e)

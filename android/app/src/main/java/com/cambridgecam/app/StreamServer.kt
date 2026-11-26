@@ -239,6 +239,13 @@ class StreamServer(
         frames.offer(jpeg)
     }
 
+    fun sendAudio(payload: ByteArray) {
+        val socket = client ?: return
+        infoExecutor.execute {
+            try { write(socket, 9, payload) } catch (_: IOException) { dropClient(socket) }
+        }
+    }
+
     fun sendInfo(info: JSONObject) {
         val socket = client ?: return
         val bytes = info.toString().toByteArray(Charsets.UTF_8)

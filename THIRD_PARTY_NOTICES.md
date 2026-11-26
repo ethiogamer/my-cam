@@ -17,6 +17,10 @@ own license. Full license texts are in the `licenses` folder (and inside each ap
 | [ifaddr](https://github.com/ifaddr/ifaddr) | listing network addresses | MIT — `licenses/ifaddr-MIT.txt` | © 2014 Stefan C. Mueller |
 | [qrcode](https://github.com/lincolnloop/python-qrcode) | the pairing QR code | BSD — `licenses/qrcode-BSD.txt` | © 2011 Lincoln Loop |
 | [PyInstaller](https://pyinstaller.org) bootloader | packaging into one .exe | GPL 2.0 with bootloader exception — `licenses/PyInstaller.txt` | © PyInstaller Development Team |
+| [python-sounddevice](https://github.com/spatialaudio/python-sounddevice) | microphones and speakers | MIT — `licenses/sounddevice-MIT.txt` | © Matthias Geier |
+| [PortAudio](https://www.portaudio.com) (WASAPI/MME build, without ASIO) | audio device access | MIT — `licenses/PortAudio-MIT.txt` | © Ross Bencina and Phil Burk |
+| [cffi](https://cffi.readthedocs.io) | connects Python to PortAudio | MIT — `licenses/cffi-MIT.txt` | © Armin Rigo, Maciej Fijalkowski |
+| cbvideo.dll (CamBridge's own code) | video decoding and MP4 recording through Windows Media Foundation (part of Windows) | CamBridge Free License | © 2026 ethiogamer |
 | Tcl/Tk (part of Python) | the window | Tcl/Tk license (BSD-style) | © The Regents of the University of California, Sun Microsystems and others |
 
 **LGPL components (pystray, python-zeroconf):** their source code is available at the links

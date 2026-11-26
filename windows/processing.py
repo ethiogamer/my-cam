@@ -9,16 +9,17 @@ import io
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
-DEFAULT_ADJUST = {"brightness": 0, "contrast": 0, "saturation": 0, "warmth": 0, "tint": 0}
+DEFAULT_ADJUST = {"brightness": 0, "contrast": 0, "saturation": 0, "vibrance": 0, "warmth": 0, "tint": 0,
+                  "hue": 0, "gamma": 0, "sharpness": 0, "backlight": 0}
 DEFAULT_FRAMING = {"zoom": 1.0, "pan_x": 0.0, "pan_y": 0.0, "rotate": 0, "mirror": False, "flip": False}
 
 # Quick looks: each filter is just a preset of the adjustments above.
 FILTERS = {
     "None": {},
-    "Vivid": {"saturation": 35, "contrast": 15},
+    "Vivid": {"saturation": 20, "vibrance": 35, "contrast": 15, "sharpness": 25},
     "Warm": {"warmth": 35, "saturation": 10},
     "Cool": {"warmth": -35},
-    "Bright": {"brightness": 20, "contrast": -5},
+    "Bright": {"brightness": 10, "backlight": 40, "gamma": 15},
     "Soft": {"contrast": -20, "saturation": -10, "brightness": 5},
     "Mono": {"saturation": -100, "contrast": 10},
 }
@@ -32,20 +33,64 @@ def _clamp(v):
     return 0 if v < 0 else 255 if v > 255 else int(round(v))
 
 
+class Look:
+    """Everything needed to colour-correct a picture, prepared once per settings change."""
+
+    def __init__(self, lut=None, hue=0.0, sharpness=0):
+        self.lut = lut              # 768-entry YCbCr table (or None)
+        self.hue_matrix = _hue_matrix(hue) if abs(hue) >= 1 else None
+        self.sharpness = sharpness  # 0..100
+
+    def __bool__(self):
+        return bool(self.lut) or self.hue_matrix is not None or self.sharpness > 0
+
+
+def _hue_matrix(degrees):
+    import math
+    a = math.radians(degrees)
+    c, s = math.cos(a), math.sin(a)
+    lr, lg, lb = 0.213, 0.715, 0.072
+    m = (
+        lr + c * (1 - lr) + s * (-lr), lg + c * (-lg) + s * (-lg), lb + c * (-lb) + s * (1 - lb), 0,
+        lr + c * (-lr) + s * 0.143, lg + c * (1 - lg) + s * 0.140, lb + c * (-lb) + s * (-0.283), 0,
+        lr + c * (-lr) + s * (-(1 - lr)), lg + c * (-lg) + s * lg, lb + c * (1 - lb) + s * lb, 0,
+    )
+    return m
+
+
 def build_lut(adjust):
-    """Returns a 768-entry YCbCr lookup table, or None if nothing is changed."""
+    """Returns a Look for the adjustments, or None if nothing is changed."""
     a = {k: float(adjust.get(k, 0)) for k in DEFAULT_ADJUST}
     if all(abs(v) < 0.5 for v in a.values()):
         return None
-    bright = a["brightness"] / 100.0 * 60.0
-    contrast = 1.0 + a["contrast"] / 100.0 * 0.8
-    sat = max(0.0, 1.0 + a["saturation"] / 100.0)
-    warm = a["warmth"] / 100.0 * 22.0
-    tint = a["tint"] / 100.0 * 16.0
-    y = [_clamp((v - 128) * contrast + 128 + bright) for v in range(256)]
-    cb = [_clamp((v - 128) * sat + 128 - warm + tint) for v in range(256)]
-    cr = [_clamp((v - 128) * sat + 128 + warm + tint) for v in range(256)]
-    return y + cb + cr
+    table = None
+    if any(abs(a[k]) >= 0.5 for k in ("brightness", "contrast", "saturation", "vibrance", "warmth",
+                                       "tint", "gamma", "backlight")):
+        bright = a["brightness"] / 100.0 * 60.0
+        contrast = 1.0 + a["contrast"] / 100.0 * 0.8
+        sat = max(0.0, 1.0 + a["saturation"] / 100.0)
+        vib = a["vibrance"] / 100.0
+        warm = a["warmth"] / 100.0 * 22.0
+        tint = a["tint"] / 100.0 * 16.0
+        gamma = 2.0 ** (-a["gamma"] / 100.0)
+        lift = max(0.0, a["backlight"]) / 100.0 * 70.0
+        y = []
+        for v in range(256):
+            t = (v - 128) * contrast + 128 + bright
+            t = 255.0 * (max(0.0, min(255.0, t)) / 255.0) ** gamma
+            t += lift * (1.0 - t / 255.0) ** 2        # lift dark areas (backlit faces)
+            y.append(_clamp(t))
+
+        def chroma(v, shift):
+            d = (v - 128) * sat
+            d *= 1.0 + vib * (1.0 - min(1.0, abs(d) / 110.0))  # boosts dull colours more
+            return _clamp(128 + d + shift)
+
+        cb = [chroma(v, -warm + tint) for v in range(256)]
+        cr = [chroma(v, warm + tint) for v in range(256)]
+        table = y + cb + cr
+    look = Look(table, a["hue"], max(0.0, a["sharpness"]))
+    return look if look else None
 
 
 def fit_to(img, width, height):
@@ -63,17 +108,35 @@ def fit_to(img, width, height):
     return canvas
 
 
-def process(jpeg, width, height, framing=None, lut=None):
-    """JPEG bytes from the iPhone -> finished RGB picture of exactly width x height."""
+def process(jpeg, width, height, framing=None, lut=None, sharpen=True):
+    """JPEG bytes from the phone -> finished RGB picture of exactly width x height."""
     framing = framing or DEFAULT_FRAMING
     rotate = int(framing.get("rotate", 0)) % 360
     zoom = max(1.0, float(framing.get("zoom", 1.0)))
-
     img = Image.open(io.BytesIO(jpeg))
     need_w, need_h = (width, height) if rotate in (0, 180) else (height, width)
-    want = "YCbCr" if lut else "RGB"
+    want = "YCbCr" if (lut and lut.lut) else "RGB"
     img.draft(want, (int(need_w * zoom), int(need_h * zoom)))  # cheap shrink while decoding
     img.load()
+    return process_image(img, width, height, framing, lut, sharpen)
+
+
+def is_plain(framing, lut):
+    """True when nothing needs changing (the fast path can be used)."""
+    if lut:
+        return False
+    f = framing or DEFAULT_FRAMING
+    return (float(f.get("zoom", 1.0)) <= 1.001 and int(f.get("rotate", 0)) % 360 == 0
+            and not f.get("mirror") and not f.get("flip"))
+
+
+def process_image(img, width, height, framing=None, lut=None, sharpen=True):
+    """Any picture -> framing + colour adjustments -> RGB picture of exactly width x height."""
+    framing = framing or DEFAULT_FRAMING
+    rotate = int(framing.get("rotate", 0)) % 360
+    zoom = max(1.0, float(framing.get("zoom", 1.0)))
+    look = lut
+    want = "YCbCr" if (look and look.lut) else "RGB"
     if img.mode != want:
         img = img.convert(want)
 
@@ -95,8 +158,14 @@ def process(jpeg, width, height, framing=None, lut=None):
         img = img.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
 
     img = fit_to(img, width, height)
-    if lut:
-        img = img.point(lut).convert("RGB")
+    if look:
+        if look.lut:
+            img = img.point(look.lut).convert("RGB")
+        if look.hue_matrix is not None:
+            img = img.convert("RGB", look.hue_matrix)
+        if look.sharpness > 0 and sharpen:
+            k = look.sharpness / 100.0 * 0.9
+            img = img.filter(ImageFilter.Kernel((3, 3), [0, -k, 0, -k, 1 + 4 * k, -k, 0, -k, 0], 1))
     return img
 
 

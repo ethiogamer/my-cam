@@ -43,6 +43,12 @@ class MainActivity : ComponentActivity() {
     private lateinit var server: StreamServer
     private lateinit var camera: CameraController
     private lateinit var wifi: WifiLink
+    private lateinit var mic: MicStreamer
+    private var micWanted = false
+
+    private val askMic = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted && micWanted) startMic()
+    }
     private lateinit var scanBanner: TextView
     private val handler = Handler(Looper.getMainLooper())
     private var fps = 0
@@ -75,7 +81,9 @@ class MainActivity : ComponentActivity() {
         camera = CameraController(this, previewView, server,
             onScreenOff = { off -> showDark(off) },
             onChanged = { updateStatus() },
-            onQr = { text -> wifi.handleUrl(text); updateStatus() })
+            onQr = { text -> wifi.handleUrl(text); updateStatus() },
+            onMicWanted = { on -> runOnUiThread { setMic(on) } })
+        mic = MicStreamer(server)
         server.start()
         wifi = WifiLink(this, server) { runOnUiThread { updateStatus() } }
         wifi.start()
@@ -94,6 +102,27 @@ class MainActivity : ComponentActivity() {
         started = true
         permissionView.visibility = View.GONE
         camera.start()
+    }
+
+    /** The PC chose the phone microphone (or stopped using it). */
+    private fun setMic(on: Boolean) {
+        micWanted = on
+        if (!on) {
+            mic.stop()
+            camera.micOn = false
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            startMic()
+        } else {
+            askMic.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    private fun startMic() {
+        mic.start()
+        camera.micOn = true
+        camera.sendInfo()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -167,6 +196,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         handler.removeCallbacks(ticker)
         if (::wifi.isInitialized) wifi.stop()
+        if (::mic.isInitialized) mic.stop()
         camera.stop()
         server.stop()
         super.onDestroy()

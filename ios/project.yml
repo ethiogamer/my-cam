@@ -28,6 +28,7 @@ targets:
         UISupportedInterfaceOrientations~ipad:
           - UIInterfaceOrientationPortrait
         NSCameraUsageDescription: CamBridge uses the camera to send live video to your PC as a webcam.
+        NSMicrophoneUsageDescription: CamBridge sends your microphone to the PC when you choose the phone mic there.
         NSLocalNetworkUsageDescription: CamBridge finds your PC on Wi-Fi and sends it your camera video.
         NSBonjourServices:
           - _cambridge._tcp

@@ -3,6 +3,7 @@
 iPhone app  --USB cable (Apple usbmuxd)-->  this program  -->  "CamBridge" virtual webcam
 """
 
+import collections
 import io
 import json
 import logging
@@ -20,6 +21,7 @@ import adb
 import processing
 import recorder
 import usbmux
+import video
 import virtualcam
 import wifi
 
@@ -30,7 +32,10 @@ MAGIC = b"CBG1"
 MSG_JPEG = 1
 MSG_INFO = 2
 MSG_COMMAND = 3
-OUTPUT_SIZES = {"1080p": (1920, 1080), "720p": (1280, 720)}
+MSG_H264 = 7
+MSG_HEVC = 8
+MSG_AUDIO = 9
+OUTPUT_SIZES = {"720p": (1280, 720), "1080p": (1920, 1080), "1440p": (2560, 1440), "4K": (3840, 2160)}
 
 log = logging.getLogger("cambridge")
 
@@ -54,6 +59,11 @@ class Settings:
         "pc_id": "",
         "pair_key": "",
         "trusted": {},
+        "audio_source": "none",
+        "audio_send_to": "",
+        "audio_fx": {"gain_db": 0.0, "limiter": True, "gate": False, "clarity": False},
+        "high_performance": False,
+        "adaptive": True,
     }
 
     def __init__(self):
@@ -113,6 +123,38 @@ class FrameSlot:
         with self._cond:
             return self._jpeg, self._seq
 
+    def poke(self):
+        """Wakes the camera thread (video packets arrived)."""
+        with self._cond:
+            self._cond.notify_all()
+
+
+class VideoQueue:
+    """H.264/HEVC packets in arrival order (they must ALL be decoded, in order)."""
+
+    def __init__(self, slot):
+        self.slot = slot
+        self.items = collections.deque()
+        self.lock = threading.Lock()
+
+    def put(self, codec, payload):
+        with self.lock:
+            self.items.append((codec, payload))
+        self.slot.poke()
+
+    def take_all(self):
+        with self.lock:
+            items = list(self.items)
+            self.items.clear()
+        return items
+
+    def reset(self):
+        with self.lock:
+            self.items.clear()
+
+    def __len__(self):
+        return len(self.items)
+
 
 # ---------------------------------------------------------------------------
 # iPhone connection
@@ -154,6 +196,11 @@ class PhoneLink(threading.Thread):
         self._sock = None
         self._send_lock = threading.Lock()
         self._last_launch = 0.0
+        self.video = VideoQueue(slot)
+        self.audio = None          # AudioHub
+        self.audio_wanted = False
+        self.on_connect = {}       # extra settings sent to every phone that connects
+        self.bytes_in = 0
         self._wifi = queue.Queue()
         self.transport = ""
 
@@ -320,6 +367,8 @@ class PhoneLink(threading.Thread):
                     raise NoApp()
                 self._on_message(*first)
             self._set("connected", "Connected to %s" % name if name != "iPhone" else "Connected to iPhone", "")
+            self.video.reset()
+            self.send_command(keyframe=True, audio=self.audio_wanted, **self.on_connect)
             self._receive(sock)
         except NoApp:
             if "Wi-Fi" in name:
@@ -342,6 +391,14 @@ class PhoneLink(threading.Thread):
                 time.sleep(0.5)
 
     def _on_message(self, msg_type, payload):
+        self.bytes_in += len(payload) + 12
+        if msg_type == MSG_H264 or msg_type == MSG_HEVC:
+            self.video.put("hevc" if msg_type == MSG_HEVC else "h264", payload)
+            return
+        if msg_type == MSG_AUDIO:
+            if self.audio is not None:
+                self.audio.phone_audio(payload)
+            return
         if msg_type == MSG_JPEG:
             self.slot.put(payload)
         elif msg_type == MSG_INFO:
@@ -365,7 +422,7 @@ class PhoneLink(threading.Thread):
                               "Keep the CamBridge app open on the phone screen.")
                 continue
             self._on_message(msg_type, payload)
-            if msg_type == MSG_JPEG:
+            if msg_type in (MSG_JPEG, MSG_H264, MSG_HEVC):
                 idle_since = time.monotonic()
                 if self.status != connected_status:
                     self._set("connected", connected_status, "")
@@ -384,30 +441,42 @@ class NoApp(Exception):
 # ---------------------------------------------------------------------------
 
 class CameraPump(threading.Thread):
-    """Takes the newest iPhone picture, applies framing/adjustments, and feeds the
-    virtual camera. Also handles the pause screen and recording."""
+    """Takes the newest phone picture (JPEG, or decoded H.264/HEVC video), applies framing
+    and adjustments, and feeds the virtual camera. Also: pause screen, recording, stats."""
+
+    PREVIEW = (960, 540)
 
     def __init__(self, slot, link, size, adjust=None, framing=None):
         super().__init__(daemon=True)
         self.slot = slot
         self.link = link
         self.size = size
+        self.audio = None             # AudioHub
         self.running = True
         self.error = None
         self.fps = 0
         self.in_use = False
         self.paused = False
-        self.last_output = None      # newest finished picture (for the preview)
+        self.last_output = None       # newest finished picture (for the preview)
         self.output_seq = 0
-        self.recorder = None
+        self.recorder = None          # RecordingWorker
         self.record_error = None
+        self.last_recording = None
+        self.stats = video.Stats()
+        self.codec = "—"
+        self.decoder_name = video.backend_name()
         self.cam = None
         self._lock = threading.Lock()
         self._new_size = None
         self._framing = dict(framing or processing.DEFAULT_FRAMING)
         self._lut = processing.build_lut(adjust or {})
         self._pause_frame = None
-        self._want_record = None     # True = start, False = stop
+        self._want_record = None
+        self._decoder = None
+        self._decoder_codec = None
+        self._need_key = True
+        self._last_preview = 0.0
+        self._last_key_request = 0.0
 
     # ---- called from the window
     def resize(self, size):
@@ -448,22 +517,161 @@ class CameraPump(threading.Thread):
             log.exception("camera error")
             self.error = str(e)
         finally:
-            self._close_recorder()
+            self._stop_recorder(wait=True)
+            self._close_decoder()
             if self.cam:
                 self.cam.close()
 
-    def _close_recorder(self):
-        rec, self.recorder = self.recorder, None
-        if rec:
+    def _close_decoder(self):
+        if self._decoder is not None:
             try:
-                files = rec.close()
-                log.info("recording saved: %s", files)
-            except OSError as e:
-                log.error("recording close failed: %s", e)
+                self._decoder.close()
+            except Exception:
+                pass
+        self._decoder = None
+        self._decoder_codec = None
+        self._need_key = True
+
+    def _request_keyframe(self):
+        now = time.monotonic()
+        if now - self._last_key_request > 0.5:
+            self._last_key_request = now
+            self.stats.keyframe_requests += 1
+            self.link.send_command(keyframe=True)
+
+    def _start_recorder(self, w, h):
+        rate, channels = self.audio.recording_format() if self.audio else (0, 0)
+        fps = int(self.link.info.get("actualFps") or self.link.info.get("fps") or 30)
+        try:
+            worker = recorder.RecordingWorker(w, h, fps, rate, channels)
+        except OSError as e:
+            self.record_error = str(e)
+            return
+        self.record_error = None
+        self.recorder = worker
+        if self.audio is not None:
+            self.audio.recorder = worker
+
+    def _stop_recorder(self, wait=False):
+        worker, self.recorder = self.recorder, None
+        if self.audio is not None:
+            self.audio.recorder = None
+        if worker is None:
+            return
+
+        def finish():
+            try:
+                self.last_recording = worker.stop()
+                log.info("recording saved: %s", self.last_recording)
+            except Exception as e:
+                self.record_error = str(e)
+
+        if wait:
+            finish()
+        else:
+            threading.Thread(target=finish, daemon=True).start()
 
     def _publish(self, img):
         self.last_output = img
         self.output_seq += 1
+
+    def _emit(self, bgr, now, preview=None):
+        """bgr: bytes or ctypes buffer of exactly the output size."""
+        self.cam.send(bgr)
+        if self.recorder is not None:
+            self.recorder.put_video(bytes(bgr), now)
+        if preview is not None:
+            self._publish(preview)
+
+    @staticmethod
+    def _finish(img, look, fast_sharp, w, h):
+        """RGB picture -> BGR bytes for the webcam, sharpened with the fast code if needed."""
+        data = img.tobytes("raw", "BGR")
+        if fast_sharp and look and look.sharpness > 0:
+            data = bytearray(data)
+            video.sharpen(data, w, h, look.sharpness)
+        return data
+
+    # ---- video (H.264 / HEVC) -------------------------------------------------
+
+    def _video_packets(self, packets, w, h, framing, lut, now):
+        """Decodes every packet in order; shows only the newest picture."""
+        if len(packets) > 90:  # seconds behind: jump to the newest keyframe
+            keys = [i for i, (_, p) in enumerate(packets) if p and p[0] & 1]
+            if keys:
+                self.stats.dropped += keys[-1]
+                packets = packets[keys[-1]:]
+            else:
+                self.stats.dropped += len(packets)
+                self._need_key = True
+                self._request_keyframe()
+                return False
+        got = False
+        for codec, payload in packets:
+            if len(payload) < 2:
+                continue
+            self.stats.add_bytes(len(payload))
+            key, data = bool(payload[0] & 1), payload[1:]
+            if self._decoder is None or self._decoder_codec != codec:
+                self._close_decoder()
+                try:
+                    self._decoder = video.make_decoder(codec)
+                    self._decoder_codec = codec
+                    self.decoder_name = self._decoder.backend
+                    self.codec = codec.upper().replace("H264", "H.264")
+                except RuntimeError as e:
+                    self.error_note = str(e)
+                    self.codec = "%s (no decoder)" % codec.upper()
+                    return False
+                self._request_keyframe()
+            if self._need_key and not key:
+                self.stats.dropped += 1
+                self._request_keyframe()
+                continue
+            self._need_key = False
+            t0 = time.perf_counter()
+            try:
+                n = self._decoder.decode(data)
+            except RuntimeError as e:
+                log.warning("decode error: %s", e)
+                self._close_decoder()
+                self._request_keyframe()
+                return got
+            self.stats.decode_ms = self.stats.smooth(self.stats.decode_ms, (time.perf_counter() - t0) * 1000)
+            got = got or n > 0
+        if not got or self._decoder is None:
+            return False
+
+        t0 = time.perf_counter()
+        dec = self._decoder
+        preview = None
+        if processing.is_plain(framing, lut):
+            buf = dec.to_bgr(w, h)
+            if buf is None:
+                return False
+            if now - self._last_preview > 0.1:
+                self._last_preview = now
+                pw, ph = self.PREVIEW
+                pbuf = dec.to_bgr(pw, ph, slot="preview")
+                if pbuf is not None:
+                    preview = Image.frombuffer("RGB", (pw, ph), bytes(pbuf), "raw", "BGR", 0, 1)
+            self._emit(buf, now, preview)
+        else:
+            src = dec.size() or (w, h)
+            zoom = max(1.0, float(framing.get("zoom", 1.0)))
+            scale = min(1.0, max(w, h) * zoom / max(src))
+            sw, sh = max(2, int(src[0] * scale) & ~1), max(2, int(src[1] * scale) & ~1)
+            buf = dec.to_bgr(sw, sh)
+            if buf is None:
+                return False
+            img = Image.frombuffer("RGB", (sw, sh), bytes(buf), "raw", "BGR", 0, 1)
+            fast_sharp = video.native_sharpen_available()
+            out = processing.process_image(img, w, h, framing, lut, sharpen=not fast_sharp)
+            self._emit(self._finish(out, lut, fast_sharp, w, h), now, out)
+        self.stats.process_ms = self.stats.smooth(self.stats.process_ms, (time.perf_counter() - t0) * 1000)
+        return True
+
+    # ---- main loop --------------------------------------------------------------
 
     def _loop(self):
         seq = 0
@@ -472,6 +680,7 @@ class CameraPump(threading.Thread):
         filler = None
         filler_key = None
         count, count_start = 0, time.monotonic()
+        self.error_note = None
 
         while self.running:
             with self._lock:
@@ -479,7 +688,7 @@ class CameraPump(threading.Thread):
                 framing, lut, paused = self._framing, self._lut, self.paused
                 want_record, self._want_record = self._want_record, None
             if new_size and new_size != self.size:
-                self._close_recorder()
+                self._stop_recorder()
                 self.cam.close()
                 self.size = new_size
                 self.cam = virtualcam.VirtualCamera(*self.size)
@@ -487,57 +696,62 @@ class CameraPump(threading.Thread):
             w, h = self.size
 
             if want_record is True and self.recorder is None:
-                try:
-                    self.recorder = recorder.AviRecorder(w, h)
-                    self.record_error = None
-                except OSError as e:
-                    self.record_error = str(e)
+                self._start_recorder(w, h)
             elif want_record is False:
-                self._close_recorder()
+                self._stop_recorder()
 
             jpeg, new_seq = self.slot.wait_newer(seq, 0.2)
+            packets = self.link.video.take_all()
             now = time.monotonic()
-            out = None
+            emitted = False
 
             if paused:
                 if self._pause_frame is None or self._pause_frame.size != (w, h):
                     self._pause_frame = processing.make_pause_screen(self.last_output, w, h)
+                if packets:  # keep the decoder in step so resuming is instant
+                    self._video_packets(packets, *self.PREVIEW, processing.DEFAULT_FRAMING, None, now)
                 if now - last_filler > 0.2:
-                    out = self._pause_frame
+                    self._emit(self._pause_frame.tobytes("raw", "BGR"), now)
                     last_filler = now
+                seq = new_seq
+                continue
+
+            if packets:
+                if self._video_packets(packets, w, h, framing, lut, now):
+                    last_frame = now
+                    count += 1
+                    emitted = True
                 seq = new_seq
             elif new_seq != seq and jpeg:
                 seq = new_seq
+                self.codec = "JPEG"
+                t0 = time.perf_counter()
                 try:
                     phone_rot = int(self.link.info.get("frameRotation", 0) or 0)
+                    f = framing
                     if phone_rot:
-                        framing = dict(framing, rotate=(int(framing.get("rotate", 0)) + phone_rot) % 360)
-                    out = processing.process(jpeg, w, h, framing, lut)
+                        f = dict(framing, rotate=(int(framing.get("rotate", 0)) + phone_rot) % 360)
+                    fast_sharp = video.native_sharpen_available()
+                    out = processing.process(jpeg, w, h, f, lut, sharpen=not fast_sharp)
+                    self.stats.add_bytes(len(jpeg))
+                    self._emit(self._finish(out, lut, fast_sharp, w, h), now, out)
+                    self.stats.process_ms = self.stats.smooth(self.stats.process_ms, (time.perf_counter() - t0) * 1000)
                     last_frame = now
                     count += 1
+                    emitted = True
                 except Exception as e:  # a broken picture: skip it
                     log.warning("bad frame: %s", e)
-            elif now - last_frame > 1.5 and now - last_filler > 0.2:
+
+            if not emitted and now - last_frame > 1.5 and now - last_filler > 0.2:
                 _, status, _, _ = self.link.snapshot()
                 key = (w, h, status)
                 if key != filler_key:
                     filler = processing.make_placeholder(w, h, "CamBridge", status)
                     filler_key = key
-                out = filler
+                self.cam.send(filler.tobytes("raw", "BGR"))
                 last_filler = now
-
-            if out is not None:
-                self.cam.send(out.tobytes("raw", "BGR"))
-                if out is not filler:
-                    self._publish(out)
-                if self.recorder is not None:
-                    try:
-                        buf = io.BytesIO()
-                        out.save(buf, "JPEG", quality=85)
-                        self.recorder.add_jpeg(buf.getvalue())
-                    except OSError as e:
-                        self.record_error = str(e)
-                        self._close_recorder()
+                if self._decoder is not None and last_frame > 0 and now - last_frame > 3:
+                    self._close_decoder()
 
             if now - count_start >= 1.0:
                 self.fps = round(count / (now - count_start))
@@ -635,7 +849,27 @@ def self_test():
     wifi.qr_image(url, 200)
     from zeroconf import Zeroconf  # discovery library is bundled
     assert Zeroconf
+    import audio  # sound library is bundled
+    audio.list_devices("input")
     if sys.platform == "win32":
+        assert audio._sd() is not None, "sound library missing"
+        assert audio.audioop is not None, "audioop missing"
+        # The video DLL must be inside the app. (GitHub's build servers may not have
+        # Windows' video codecs, so decoding/recording problems are only reported.)
+        assert video._dll_path() and os.path.exists(video._dll_path()), "cbvideo.dll missing"
+        print("video decoder:", video.backend_name())
+        try:
+            import tempfile
+            rec = recorder.Mp4Recorder(640, 360, 30, 48000, 1, folder=tempfile.gettempdir())
+            frame = bytes(640 * 360 * 3)
+            for i in range(15):
+                rec.add_video(frame, i / 30)
+                rec.add_audio(bytes(1600 * 2), 1600, i / 30)
+            files = rec.close()
+            print("mp4 test:", files[0], os.path.getsize(files[0]))
+            os.remove(files[0])
+        except Exception as e:
+            print("mp4 test skipped:", e)
         cam = virtualcam.VirtualCamera(1280, 720)
         for _ in range(10):
             cam.send(bgr)
@@ -691,15 +925,21 @@ def main():
     if pump.error and "already running" in pump.error:
         messagebox.showinfo(APP_NAME, "CamBridge is already open — look for its icon next to the clock.")
         return
+    import audio as audiomod
+    link.on_connect = {"adaptive": settings["adaptive"]}
+    hub = audiomod.AudioHub(settings, link)
+    link.audio = hub
+    pump.audio = hub
     link.start()
     wifi.ensure_identity(settings)
     wifi_server = wifi.WifiServer(settings, link)
     wifi_server.start()
 
-    ui.App(root, settings, slot, link, pump, core=sys.modules[__name__], wifi=wifi_server,
+    ui.App(root, settings, slot, link, pump, core=sys.modules[__name__], wifi=wifi_server, audio=hub,
            start_minimized="--minimized" in args)
     root.mainloop()
     wifi_server.stop()
+    hub.close()
     log.info("closed")
 
 

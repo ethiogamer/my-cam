@@ -274,6 +274,23 @@ private struct ProControls: View {
             Toggle("HDR video", isOn: $model.hdr)
                 .font(.subheadline)
         }
+        Toggle("Low light boost", isOn: $model.lowLight)
+            .font(.subheadline)
+
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Streaming").font(.subheadline.bold())
+            Picker("Video format", selection: $model.codec) {
+                ForEach(StreamCodec.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            Picker("Bitrate", selection: $model.bitrateLevel) {
+                ForEach(BitrateLevel.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            Text("H.264 is best for 4K 60 with low delay. Higher bitrate = more detail.")
+                .font(.caption2)
+                .foregroundColor(.white.opacity(0.6))
+        }
     }
 
     // Shutter slider is logarithmic so short and long speeds are both easy to pick.

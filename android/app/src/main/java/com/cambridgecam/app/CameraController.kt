@@ -58,7 +58,9 @@ class CameraController(
     private val onScreenOff: (Boolean) -> Unit,
     private val onChanged: () -> Unit,
     private val onQr: (String) -> Unit,
+    private val onMicWanted: (Boolean) -> Unit = {},
 ) {
+    var micOn = false
     /** Looking for the pairing QR code on the PC screen. */
     @Volatile var scanning = false
     private var scanCounter = 0
@@ -467,6 +469,7 @@ class CameraController(
         if (c.has("stabilization")) stabilization = c.optBoolean("stabilization") && stabilizationSupported
         if (c.has("screenOff")) setScreenOff(c.optBoolean("screenOff"))
         if (c.has("focusCenter")) focusAt(previewView.width / 2f, previewView.height / 2f)
+        if (c.has("audio")) onMicWanted(c.optBoolean("audio"))
         if (c.has("resetPro")) {
             exposureManual = false; focusManual = false; wbManual = false; exposureEv = 0f
             applyEv()
@@ -534,6 +537,9 @@ class CameraController(
             if (liveShutter.isFinite()) info.put("liveShutter", liveShutter)
             info.put("liveLens", liveFocus.toDouble())
             info.put("frameRotation", frameRotation)
+            info.put("codec", "jpeg")
+            info.put("codecs", JSONArray().put("jpeg"))
+            info.put("audio", micOn)
             if (frameWidth > 0) {
                 info.put("width", frameWidth)
                 info.put("height", frameHeight)

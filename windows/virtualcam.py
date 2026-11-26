@@ -139,7 +139,7 @@ class VirtualCamera:
         self._dll.scCreateCamera.restype = ctypes.c_void_p
         self._dll.scDeleteCamera.argtypes = [ctypes.c_void_p]
         self._dll.scDeleteCamera.restype = None
-        self._dll.scSendFrame.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self._dll.scSendFrame.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         self._dll.scSendFrame.restype = None
         self._dll.scIsConnected.argtypes = [ctypes.c_void_p]
         self._dll.scIsConnected.restype = ctypes.c_bool
@@ -149,7 +149,7 @@ class VirtualCamera:
             raise RuntimeError("CamBridge is already running (only one copy can run).")
 
     def send(self, bgr_bytes):
-        """`bgr_bytes`: width*height*3 bytes, top row first, Blue-Green-Red order."""
+        """`bgr_bytes`: width*height*3 bytes (bytes or a ctypes buffer), top row first, BGR order."""
         if self._cam:
             self._dll.scSendFrame(self._cam, bgr_bytes)
 

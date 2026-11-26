@@ -18,7 +18,18 @@ final class StreamServer {
         case command = 3
         case hello = 5
         case welcome = 6
+        case h264 = 7
+        case hevc = 8
+        case audio = 9
     }
+
+    /// Video: the link fell behind and frames were dropped; the encoder must send a keyframe.
+    var onNeedKeyframe: (() -> Void)?
+    /// Video: the link is congested (for "keep it smooth" bitrate lowering).
+    var onCongestion: (() -> Void)?
+    private var videoInFlight = 0
+    private var videoDropping = false
+    static let maxInFlightBytes = 6_000_000
 
     /// Called (on any thread) when the PC connects or disconnects.
     var onConnectionChange: ((Bool) -> Void)?
@@ -235,6 +246,8 @@ final class StreamServer {
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
+        videoInFlight = 0
+        videoDropping = false
         if wasOutgoing { onOutgoingClosed?(wasAccepted) }
         lock.lock()
         _sending = false
@@ -254,6 +267,43 @@ final class StreamServer {
 
     func sendFrame(_ jpeg: Data) {
         send(type: .jpeg, payload: jpeg, isFrame: true)
+    }
+
+    /// Video frames must arrive in order; when the link can't keep up we skip ahead to
+    /// the next keyframe instead of building up delay.
+    func sendVideo(_ payload: Data, hevc: Bool, keyframe: Bool) {
+        queue.async {
+            guard let conn = self.connection, self.isConnected else { return }
+            if self.videoDropping && !keyframe { return }
+            if self.videoInFlight > StreamServer.maxInFlightBytes {
+                self.videoDropping = true
+                self.onNeedKeyframe?()
+                self.onCongestion?()
+                return
+            }
+            if keyframe { self.videoDropping = false }
+            let size = payload.count + 12
+            self.videoInFlight += size
+            var message = Data(capacity: size)
+            message.append(contentsOf: Array("CBG1".utf8))
+            message.append(StreamServer.bigEndianBytes((hevc ? MessageType.hevc : MessageType.h264).rawValue))
+            message.append(StreamServer.bigEndianBytes(UInt32(payload.count)))
+            message.append(payload)
+            conn.send(content: message, completion: .contentProcessed { [weak self] error in
+                guard let self = self else { return }
+                self.queue.async { self.videoInFlight = max(0, self.videoInFlight - size) }
+                if error == nil {
+                    self.lock.lock()
+                    self._sentFrames += 1
+                    self.lock.unlock()
+                }
+            })
+        }
+    }
+
+    /// payload: 4-byte sample rate (big-endian), 1-byte channels, 16-bit PCM.
+    func sendAudio(_ payload: Data) {
+        send(type: .audio, payload: payload, isFrame: false)
     }
 
     func sendInfo(_ dict: [String: Any]) {
