@@ -98,7 +98,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python tools
-        run: python -m pip install pillow pyinstaller
+        run: python -m pip install pillow pyinstaller pystray
 
       - name: Self-test (source)
         working-directory: windows
@@ -112,6 +112,7 @@ jobs:
           --add-data "icon.ico;."
           --add-binary "bin/akremcam64.dll;."
           --add-binary "bin/akremcam32.dll;."
+          --hidden-import pystray._win32
           akremcam.py
 
       - name: Self-test (finished .exe)

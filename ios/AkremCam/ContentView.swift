@@ -3,6 +3,8 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject var model: CameraModel
+    @State private var showPanel = false
+    @State private var panelTab = 0
 
     var body: some View {
         ZStack {
@@ -16,13 +18,18 @@ struct ContentView: View {
                               onPinch: { scale, began in model.pinch(scale: scale, began: began) })
                 .ignoresSafeArea()
 
-                VStack(spacing: 0) {
+                VStack(spacing: 10) {
                     StatusBar()
                     Spacer()
-                    Controls()
+                    if showPanel {
+                        ControlPanel(tab: $panelTab)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                    Toolbar(showPanel: $showPanel)
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
+                .animation(.easeOut(duration: 0.2), value: showPanel)
             }
 
             if model.screenOff {
@@ -95,79 +102,205 @@ private struct RoundButton: View {
     }
 }
 
-// MARK: - Controls
+// MARK: - Toolbar (always visible)
 
-private struct Controls: View {
+private struct Toolbar: View {
     @EnvironmentObject var model: CameraModel
+    @Binding var showPanel: Bool
 
     var body: some View {
-        VStack(spacing: 10) {
+        HStack(spacing: 10) {
+            RoundButton(system: "arrow.triangle.2.circlepath.camera", active: false, label: "Switch camera") {
+                model.side = model.side == .back ? .front : .back
+            }
+            Spacer(minLength: 0)
             if model.availableLenses.count > 1 {
-                HStack(spacing: 10) {
+                HStack(spacing: 6) {
                     ForEach(model.availableLenses) { lens in
                         Button {
                             model.lens = lens
                         } label: {
                             Text(lens.rawValue)
-                                .font(.system(size: 14, weight: .bold))
-                                .frame(minWidth: 52, minHeight: 36)
-                                .background(
-                                    Capsule().fill(model.lens == lens ? Color.yellow : Color.black.opacity(0.55))
-                                )
+                                .font(.system(size: 13, weight: .bold))
+                                .frame(minWidth: 44, minHeight: 34)
+                                .background(Capsule().fill(model.lens == lens ? Color.yellow : Color.black.opacity(0.55)))
                                 .foregroundColor(model.lens == lens ? .black : .white)
                         }
                     }
                 }
             }
-
-            VStack(spacing: 10) {
-                if model.maxZoom > 1.01 {
-                    SliderRow(icon: "plus.magnifyingglass",
-                              value: Binding(get: { Double(model.zoom) }, set: { model.zoom = CGFloat($0) }),
-                              range: 1...Double(model.maxZoom),
-                              text: String(format: "%.1fx", Double(model.zoom)))
-                }
-                SliderRow(icon: "sun.max.fill",
-                          value: Binding(get: { Double(model.exposureBias) }, set: { model.exposureBias = Float($0) }),
-                          range: -Double(CameraModel.exposureLimit)...Double(CameraModel.exposureLimit),
-                          text: String(format: "%+.1f", Double(model.exposureBias)))
-
-                Picker("Camera", selection: $model.side) {
-                    ForEach(CameraSide.allCases) { Text($0.rawValue).tag($0) }
-                }
-                .pickerStyle(.segmented)
-
-                HStack(spacing: 8) {
-                    Picker("Quality", selection: $model.quality) {
-                        ForEach(VideoQuality.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    Picker("Frame rate", selection: $model.frameRate) {
-                        ForEach(FrameRate.allCases) { Text($0.label).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                }
-
-                HStack {
-                    Toggle("Mirror", isOn: $model.mirror)
-                        .fixedSize()
-                    Spacer()
-                    Picker("Rotation", selection: $model.orientationMode) {
-                        ForEach(OrientationMode.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    .pickerStyle(.menu)
-                }
-                .font(.subheadline)
+            Spacer(minLength: 0)
+            RoundButton(system: showPanel ? "chevron.down" : "slider.horizontal.3", active: showPanel,
+                        label: "Camera settings") {
+                showPanel.toggle()
             }
-            .padding(12)
-            .background(RoundedRectangle(cornerRadius: 16).fill(Color.black.opacity(0.55)))
-
-            Text("Tip: use the Back camera for the best picture. You can control everything from the PC too.")
-                .font(.caption2)
-                .foregroundColor(.white.opacity(0.6))
-                .multilineTextAlignment(.center)
         }
+    }
+}
+
+// MARK: - Settings panel
+
+private struct ControlPanel: View {
+    @EnvironmentObject var model: CameraModel
+    @Binding var tab: Int
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Picker("", selection: $tab) {
+                Text("Basic").tag(0)
+                Text("Pro").tag(1)
+            }
+            .pickerStyle(.segmented)
+
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 12) {
+                    if tab == 0 { BasicControls() } else { ProControls() }
+                }
+                .padding(.vertical, 2)
+            }
+            .frame(maxHeight: 290)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 18).fill(Color.black.opacity(0.7)))
         .foregroundColor(.white)
+    }
+}
+
+private struct BasicControls: View {
+    @EnvironmentObject var model: CameraModel
+
+    var body: some View {
+        if model.maxZoom > 1.01 {
+            SliderRow(icon: "plus.magnifyingglass",
+                      value: Binding(get: { Double(model.zoom) }, set: { model.zoom = CGFloat($0) }),
+                      range: 1...Double(model.maxZoom),
+                      text: String(format: "%.1fx", Double(model.zoom)))
+        }
+        SliderRow(icon: "sun.max.fill",
+                  value: Binding(get: { Double(model.exposureBias) }, set: { model.exposureBias = Float($0) }),
+                  range: -Double(CameraModel.exposureLimit)...Double(CameraModel.exposureLimit),
+                  text: String(format: "%+.1f", Double(model.exposureBias)))
+            .disabled(model.exposureManual)
+        if model.torchAvailable && model.torchOn {
+            SliderRow(icon: "flashlight.on.fill",
+                      value: Binding(get: { Double(model.torchLevel) }, set: { model.torchLevel = Float($0) }),
+                      range: 0.05...1.0,
+                      text: String(format: "%d%%", Int(model.torchLevel * 100)))
+        }
+        HStack(spacing: 8) {
+            Picker("Quality", selection: $model.quality) {
+                ForEach(VideoQuality.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            Picker("Frame rate", selection: $model.frameRate) {
+                ForEach(FrameRate.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+        }
+        HStack {
+            Toggle("Mirror", isOn: $model.mirror).fixedSize()
+            Spacer()
+            Picker("Rotation", selection: $model.orientationMode) {
+                ForEach(OrientationMode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.menu)
+        }
+        .font(.subheadline)
+    }
+}
+
+private struct ProControls: View {
+    @EnvironmentObject var model: CameraModel
+
+    var body: some View {
+        // Focus
+        ModeHeader(title: "Focus", manual: $model.focusManual, enabled: model.manualFocusSupported,
+                   live: model.liveLens >= 0 ? String(format: "%.2f", Double(model.liveLens)) : "")
+        if model.focusManual {
+            SliderRow(icon: "scope",
+                      value: Binding(get: { Double(model.lensPosition) }, set: { model.lensPosition = Float($0) }),
+                      range: 0...1, text: String(format: "%.2f", Double(model.lensPosition)))
+        }
+
+        // Exposure
+        ModeHeader(title: "Exposure", manual: $model.exposureManual, enabled: model.manualExposureSupported,
+                   live: model.liveISO > 0 ? "ISO \(Int(model.liveISO)) · \(shutterText(model.liveShutter))" : "")
+        if model.exposureManual {
+            SliderRow(icon: "camera.aperture",
+                      value: Binding(get: { Double(model.iso) }, set: { model.iso = Float($0) }),
+                      range: Double(model.isoRange.lowerBound)...Double(model.isoRange.upperBound),
+                      text: "\(Int(model.iso))")
+            SliderRow(icon: "timer",
+                      value: Binding(get: { shutterToSlider(model.shutter) },
+                                     set: { model.shutter = sliderToShutter($0) }),
+                      range: 0...1, text: shutterText(model.shutter))
+        }
+
+        // White balance
+        ModeHeader(title: "White balance", manual: $model.whiteBalanceManual,
+                   enabled: model.manualWhiteBalanceSupported,
+                   live: model.liveTemperature > 0 ? "\(Int(model.liveTemperature))K" : "")
+        if model.whiteBalanceManual {
+            SliderRow(icon: "thermometer",
+                      value: Binding(get: { Double(model.temperature) }, set: { model.temperature = Float($0) }),
+                      range: 2500...9000, text: "\(Int(model.temperature))K")
+            SliderRow(icon: "drop.fill",
+                      value: Binding(get: { Double(model.tint) }, set: { model.tint = Float($0) }),
+                      range: -100...100, text: "\(Int(model.tint))")
+        }
+
+        if model.stabilizationSupported {
+            Toggle("Stabilization (adds a little delay)", isOn: $model.stabilization)
+                .font(.subheadline)
+        }
+        if model.hdrSupported {
+            Toggle("HDR video", isOn: $model.hdr)
+                .font(.subheadline)
+        }
+    }
+
+    // Shutter slider is logarithmic so short and long speeds are both easy to pick.
+    private func shutterToSlider(_ seconds: Double) -> Double {
+        let lo = log(model.shutterRange.lowerBound), hi = log(model.shutterRange.upperBound)
+        guard hi > lo else { return 0 }
+        return (log(max(seconds, 1e-6)) - lo) / (hi - lo)
+    }
+
+    private func sliderToShutter(_ value: Double) -> Double {
+        let lo = log(model.shutterRange.lowerBound), hi = log(model.shutterRange.upperBound)
+        return exp(lo + value * (hi - lo))
+    }
+}
+
+func shutterText(_ seconds: Double) -> String {
+    guard seconds > 0 else { return "" }
+    if seconds >= 0.5 { return String(format: "%.1fs", seconds) }
+    return "1/\(Int((1.0 / seconds).rounded()))"
+}
+
+private struct ModeHeader: View {
+    let title: String
+    @Binding var manual: Bool
+    let enabled: Bool
+    let live: String
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.subheadline.bold())
+                if !live.isEmpty {
+                    Text(live).font(.caption2.monospacedDigit()).foregroundColor(.white.opacity(0.6))
+                }
+            }
+            Spacer()
+            Picker(title, selection: $manual) {
+                Text("Auto").tag(false)
+                Text("Manual").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 150)
+            .disabled(!enabled)
+        }
     }
 }
 
@@ -185,7 +318,7 @@ private struct SliderRow: View {
                 .tint(.yellow)
             Text(text)
                 .font(.caption.monospacedDigit())
-                .frame(width: 42, alignment: .trailing)
+                .frame(width: 50, alignment: .trailing)
         }
     }
 }

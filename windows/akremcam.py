@@ -13,8 +13,10 @@ import sys
 import threading
 import time
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
+import processing
+import recorder
 import usbmux
 import virtualcam
 
@@ -35,21 +37,46 @@ log = logging.getLogger("akremcam")
 # ---------------------------------------------------------------------------
 
 class Settings:
+    """Remembers PC-side choices between runs (settings.json in AppData)."""
+
+    DEFAULTS = {
+        "output": "1080p",
+        "adjust": dict(processing.DEFAULT_ADJUST),
+        "filter": "None",
+        "framing": dict(processing.DEFAULT_FRAMING),
+        "close_to_tray": True,
+        "tray_tip_shown": False,
+        "left_open": True,
+        "right_open": True,
+    }
+
     def __init__(self):
         self.path = os.path.join(virtualcam.app_data_dir(), "settings.json")
-        self.output = "1080p"
+        self.data = json.loads(json.dumps(self.DEFAULTS))
         try:
             with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if data.get("output") in OUTPUT_SIZES:
-                self.output = data["output"]
+                saved = json.load(f)
+            for key, value in saved.items():
+                if key in self.data and isinstance(value, type(self.data[key])):
+                    if isinstance(value, dict):
+                        self.data[key].update(value)
+                    else:
+                        self.data[key] = value
         except (OSError, ValueError):
             pass
+        if self.data["output"] not in OUTPUT_SIZES:
+            self.data["output"] = "1080p"
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def __setitem__(self, key, value):
+        self.data[key] = value
 
     def save(self):
         try:
             with open(self.path, "w", encoding="utf-8") as f:
-                json.dump({"output": self.output}, f)
+                json.dump(self.data, f, indent=1)
         except OSError:
             pass
 
@@ -243,62 +270,15 @@ class PhoneLink(threading.Thread):
 # Pictures -> virtual camera
 # ---------------------------------------------------------------------------
 
-def load_font(size):
-    for name in ("segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"):
-        try:
-            return ImageFont.truetype(name, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
-def make_placeholder(width, height, line1, line2=""):
-    img = Image.new("RGB", (width, height), (18, 24, 38))
-    draw = ImageDraw.Draw(img)
-    big = load_font(max(20, height // 14))
-    small = load_font(max(14, height // 30))
-    for text, font, y, color in (
-        (line1, big, height * 0.44, (235, 240, 250)),
-        (line2, small, height * 0.56, (150, 165, 190)),
-    ):
-        if not text:
-            continue
-        box = draw.textbbox((0, 0), text, font=font)
-        tw = box[2] - box[0]
-        draw.text(((width - tw) / 2, y), text, font=font, fill=color)
-    return img
-
-
-def fit_to(img, width, height):
-    """Scales the picture to fit the camera size, adding black bars if needed."""
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    iw, ih = img.size
-    if (iw, ih) == (width, height):
-        return img
-    scale = min(width / iw, height / ih)
-    nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
-    img = img.resize((nw, nh), Image.BILINEAR)
-    if (nw, nh) == (width, height):
-        return img
-    canvas = Image.new("RGB", (width, height), (0, 0, 0))
-    canvas.paste(img, ((width - nw) // 2, (height - nh) // 2))
-    return canvas
-
-
-def jpeg_to_bgr(jpeg, width, height):
-    img = Image.open(io.BytesIO(jpeg))
-    iw, ih = img.size
-    if iw >= width * 2 and ih >= height * 2:
-        img.draft("RGB", (width, height))  # fast shrink while decoding
-    img.load()
-    return fit_to(img, width, height).tobytes("raw", "BGR")
-
+# ---------------------------------------------------------------------------
+# Pictures -> virtual camera
+# ---------------------------------------------------------------------------
 
 class CameraPump(threading.Thread):
-    """Feeds the newest iPhone picture into the virtual camera."""
+    """Takes the newest iPhone picture, applies framing/adjustments, and feeds the
+    virtual camera. Also handles the pause screen and recording."""
 
-    def __init__(self, slot, link, size):
+    def __init__(self, slot, link, size, adjust=None, framing=None):
         super().__init__(daemon=True)
         self.slot = slot
         self.link = link
@@ -307,18 +287,51 @@ class CameraPump(threading.Thread):
         self.error = None
         self.fps = 0
         self.in_use = False
-        self._new_size = None
+        self.paused = False
+        self.last_output = None      # newest finished picture (for the preview)
+        self.output_seq = 0
+        self.recorder = None
+        self.record_error = None
+        self.cam = None
         self._lock = threading.Lock()
+        self._new_size = None
+        self._framing = dict(framing or processing.DEFAULT_FRAMING)
+        self._lut = processing.build_lut(adjust or {})
+        self._pause_frame = None
+        self._want_record = None     # True = start, False = stop
 
+    # ---- called from the window
     def resize(self, size):
         with self._lock:
             self._new_size = size
 
+    def set_adjust(self, adjust):
+        lut = processing.build_lut(adjust)
+        with self._lock:
+            self._lut = lut
+
+    def set_framing(self, framing):
+        with self._lock:
+            self._framing = dict(framing)
+
+    def set_paused(self, paused):
+        with self._lock:
+            self.paused = paused
+            self._pause_frame = None
+
+    def start_recording(self):
+        with self._lock:
+            self._want_record = True
+
+    def stop_recording(self):
+        with self._lock:
+            self._want_record = False
+
     def stop(self):
         self.running = False
 
+    # ---- thread
     def run(self):
-        self.cam = None
         try:
             self.cam = virtualcam.VirtualCamera(*self.size)
             self._loop()
@@ -326,450 +339,104 @@ class CameraPump(threading.Thread):
             log.exception("camera error")
             self.error = str(e)
         finally:
+            self._close_recorder()
             if self.cam:
                 self.cam.close()
+
+    def _close_recorder(self):
+        rec, self.recorder = self.recorder, None
+        if rec:
+            try:
+                files = rec.close()
+                log.info("recording saved: %s", files)
+            except OSError as e:
+                log.error("recording close failed: %s", e)
+
+    def _publish(self, img):
+        self.last_output = img
+        self.output_seq += 1
 
     def _loop(self):
         seq = 0
         last_frame = 0.0
-        last_placeholder = 0.0
-        placeholder = None
-        placeholder_key = None
+        last_filler = 0.0
+        filler = None
+        filler_key = None
         count, count_start = 0, time.monotonic()
 
         while self.running:
             with self._lock:
                 new_size, self._new_size = self._new_size, None
+                framing, lut, paused = self._framing, self._lut, self.paused
+                want_record, self._want_record = self._want_record, None
             if new_size and new_size != self.size:
+                self._close_recorder()
                 self.cam.close()
                 self.size = new_size
                 self.cam = virtualcam.VirtualCamera(*self.size)
-                placeholder_key = None
-            cam = self.cam
-
+                filler_key = None
             w, h = self.size
+
+            if want_record is True and self.recorder is None:
+                try:
+                    self.recorder = recorder.AviRecorder(w, h)
+                    self.record_error = None
+                except OSError as e:
+                    self.record_error = str(e)
+            elif want_record is False:
+                self._close_recorder()
+
             jpeg, new_seq = self.slot.wait_newer(seq, 0.2)
             now = time.monotonic()
+            out = None
 
-            if new_seq != seq and jpeg:
+            if paused:
+                if self._pause_frame is None or self._pause_frame.size != (w, h):
+                    self._pause_frame = processing.make_pause_screen(self.last_output, w, h)
+                if now - last_filler > 0.2:
+                    out = self._pause_frame
+                    last_filler = now
+                seq = new_seq
+            elif new_seq != seq and jpeg:
                 seq = new_seq
                 try:
-                    cam.send(jpeg_to_bgr(jpeg, w, h))
+                    out = processing.process(jpeg, w, h, framing, lut)
                     last_frame = now
                     count += 1
                 except Exception as e:  # a broken picture: skip it
                     log.warning("bad frame: %s", e)
-            elif now - last_frame > 1.5 and now - last_placeholder > 0.2:
-                state, status, _, _ = self.link.snapshot()
+            elif now - last_frame > 1.5 and now - last_filler > 0.2:
+                _, status, _, _ = self.link.snapshot()
                 key = (w, h, status)
-                if key != placeholder_key:
-                    placeholder = make_placeholder(w, h, "Akrem Cam", status).tobytes("raw", "BGR")
-                    placeholder_key = key
-                cam.send(placeholder)
-                last_placeholder = now
+                if key != filler_key:
+                    filler = processing.make_placeholder(w, h, "Akrem Cam", status)
+                    filler_key = key
+                out = filler
+                last_filler = now
+
+            if out is not None:
+                self.cam.send(out.tobytes("raw", "BGR"))
+                if out is not filler:
+                    self._publish(out)
+                if self.recorder is not None:
+                    try:
+                        buf = io.BytesIO()
+                        out.save(buf, "JPEG", quality=85)
+                        self.recorder.add_jpeg(buf.getvalue())
+                    except OSError as e:
+                        self.record_error = str(e)
+                        self._close_recorder()
 
             if now - count_start >= 1.0:
                 self.fps = round(count / (now - count_start))
                 count, count_start = 0, now
-                self.in_use = cam.in_use()
+                self.in_use = self.cam.in_use()
 
-
-# ---------------------------------------------------------------------------
-# Window
-# ---------------------------------------------------------------------------
 
 def resource(name):
-    return os.path.join(virtualcam.bundled_dir() if getattr(sys, "frozen", False)
-                        else os.path.dirname(os.path.abspath(__file__)), name)
+    base = virtualcam.bundled_dir() if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name)
 
-
-class App:
-    PREVIEW_W, PREVIEW_H = 560, 315
-    BG, PANEL, FG, DIM, ACCENT = "#0f1623", "#172133", "#eef2fa", "#93a1bd", "#f5c518"
-
-    def __init__(self, root, settings, slot, link, pump):
-        import tkinter as tk
-        from tkinter import ttk
-
-        self.tk = tk
-        self.root = root
-        self.settings = settings
-        self.slot = slot
-        self.link = link
-        self.pump = pump
-        self.preview_seq = -1
-        self.photo = None
-        self.touched = {}        # control -> time the user last moved it
-        self.pending = {}        # throttled commands waiting to be sent
-        self.lens_buttons = []
-        self.lens_names = []
-        self.synced = {}         # slider -> value last shown from the iPhone
-
-        root.title(APP_NAME)
-        root.configure(bg=self.BG)
-        root.resizable(False, False)
-        try:
-            root.iconbitmap(resource("icon.ico"))
-        except Exception:
-            pass
-
-        style = ttk.Style(root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure("TCombobox", padding=3)
-        style.configure("Akrem.Horizontal.TScale", background=self.ACCENT, troughcolor="#24324a",
-                        bordercolor=self.PANEL, lightcolor=self.ACCENT, darkcolor=self.ACCENT,
-                        sliderlength=16)
-
-        BG, FG, DIM = self.BG, self.FG, self.DIM
-        outer = tk.Frame(root, bg=BG, padx=18, pady=16)
-        outer.pack(fill="both", expand=True)
-
-        # ---- left: preview + status
-        left = tk.Frame(outer, bg=BG)
-        left.pack(side="left", fill="y")
-
-        tk.Label(left, text=APP_NAME, font=("Segoe UI", 18, "bold"), bg=BG, fg=FG).pack(anchor="w")
-        tk.Label(left, text="Your iPhone as a webcam — over the USB cable", font=("Segoe UI", 10),
-                 bg=BG, fg=DIM).pack(anchor="w", pady=(0, 10))
-
-        self.preview = tk.Label(left, bg="#000000", width=self.PREVIEW_W, height=self.PREVIEW_H)
-        self.preview.pack()
-
-        status_row = tk.Frame(left, bg=BG)
-        status_row.pack(fill="x", pady=(12, 0))
-        self.dot = tk.Canvas(status_row, width=14, height=14, bg=BG, highlightthickness=0)
-        self.dot.pack(side="left", padx=(0, 8))
-        self.dot_id = self.dot.create_oval(2, 2, 13, 13, fill="#f0a020", outline="")
-        self.status = tk.Label(status_row, text="Starting…", font=("Segoe UI", 12, "bold"),
-                               bg=BG, fg=FG, anchor="w")
-        self.status.pack(side="left", fill="x")
-
-        self.detail = tk.Label(left, text="", font=("Segoe UI", 9), bg=BG, fg=DIM, anchor="w",
-                               justify="left", wraplength=self.PREVIEW_W)
-        self.detail.pack(fill="x", pady=(2, 0))
-        self.stats = tk.Label(left, text="", font=("Segoe UI", 9), bg=BG, fg=DIM, anchor="w")
-        self.stats.pack(fill="x", pady=(2, 0))
-        self.warning = tk.Label(left, text="", font=("Segoe UI", 9, "bold"), bg=BG, fg="#f0a020", anchor="w")
-        self.warning.pack(fill="x")
-
-        help_text = ("1. Plug the iPhone into this PC with the cable.   "
-                     "2. Open Akrem Cam on the iPhone.\n"
-                     "3. In Zoom / Telegram / OBS / Meet, choose the camera \"Akrem Cam\".")
-        tk.Label(left, text=help_text, font=("Segoe UI", 9), bg=BG, fg=DIM, justify="left",
-                 anchor="w").pack(fill="x", pady=(10, 0))
-
-        # ---- right: iPhone controls
-        right = tk.Frame(outer, bg=self.PANEL, padx=14, pady=12)
-        right.pack(side="left", fill="y", padx=(16, 0))
-        self.controls_frame = right
-
-        tk.Label(right, text="iPhone camera", font=("Segoe UI", 12, "bold"), bg=self.PANEL,
-                 fg=FG).pack(anchor="w", pady=(0, 8))
-
-        phone = tk.Frame(right, bg=self.PANEL)
-        phone.pack(fill="x")
-        self.phone_frame = phone
-
-        self.side_var = tk.StringVar(value="Back")
-        row = self._row(phone, "Camera")
-        for name in ("Back", "Front"):
-            self._toggle_button(row, name, self.side_var, name,
-                                lambda n=name: self.command("side", side=n)).pack(side="left", padx=(0, 4))
-
-        self.lens_row = self._row(phone, "Lens")
-        self.lens_var = tk.StringVar(value="1x")
-
-        self.zoom_var = tk.DoubleVar(value=1.0)
-        self.zoom_scale = self._slider(phone, "Zoom", self.zoom_var, 1.0, 10.0, 0.1,
-                                       lambda v: self.slider_moved("zoom", float(v)))
-
-        self.exposure_var = tk.DoubleVar(value=0.0)
-        self._slider(phone, "Brightness", self.exposure_var, -2.0, 2.0, 0.1,
-                     lambda v: self.slider_moved("exposure", float(v)))
-
-        self.quality_var = tk.StringVar(value="1080p")
-        row = self._row(phone, "Quality")
-        for q in ("720p", "1080p"):
-            self._toggle_button(row, q, self.quality_var, q,
-                                lambda q=q: self.command("quality", quality=q)).pack(side="left", padx=(0, 4))
-
-        self.fps_var = tk.StringVar(value="30")
-        row = self._row(phone, "Smoothness")
-        for f in ("30", "60"):
-            self._toggle_button(row, f + " fps", self.fps_var, f,
-                                lambda f=f: self.command("fps", fps=int(f))).pack(side="left", padx=(0, 4))
-
-        self.rotation_var = tk.StringVar(value="Auto")
-        row = self._row(phone, "Rotation")
-        rot = ttk.Combobox(row, textvariable=self.rotation_var, state="readonly", width=18,
-                           values=["Auto", "Landscape", "Landscape (flipped)", "Portrait"])
-        rot.pack(side="left")
-        rot.bind("<<ComboboxSelected>>",
-                 lambda e: self.command("orientation", orientation=self.rotation_var.get()))
-
-        checks = tk.Frame(phone, bg=self.PANEL)
-        checks.pack(fill="x", pady=(8, 0))
-        self.mirror_var = tk.BooleanVar(value=False)
-        self.torch_var = tk.BooleanVar(value=False)
-        self.screen_var = tk.BooleanVar(value=False)
-        self._check(checks, "Mirror picture", self.mirror_var,
-                    lambda: self.command("mirror", mirror=self.mirror_var.get())).pack(anchor="w")
-        self.torch_check = self._check(checks, "iPhone light (flash)", self.torch_var,
-                                       lambda: self.command("torch", torch=self.torch_var.get()))
-        self.torch_check.pack(anchor="w")
-        self._check(checks, "Dark iPhone screen (saves battery)", self.screen_var,
-                    lambda: self.command("screenOff", screenOff=self.screen_var.get())).pack(anchor="w")
-
-        tk.Button(phone, text="Focus on centre", command=lambda: self.command("focus", focusCenter=True),
-                  font=("Segoe UI", 9), bg="#24324a", fg=FG, activebackground="#31425f",
-                  activeforeground=FG, relief="flat", padx=10, pady=3).pack(anchor="w", pady=(8, 0))
-
-        # ---- PC settings
-        tk.Frame(right, bg="#2a3850", height=1).pack(fill="x", pady=12)
-        tk.Label(right, text="This PC", font=("Segoe UI", 12, "bold"), bg=self.PANEL,
-                 fg=FG).pack(anchor="w", pady=(0, 6))
-        row = self._row(right, "Webcam size")
-        self.size_var = tk.StringVar(value=settings.output)
-        combo = ttk.Combobox(row, textvariable=self.size_var, values=list(OUTPUT_SIZES),
-                             state="readonly", width=8)
-        combo.pack(side="left")
-        combo.bind("<<ComboboxSelected>>", self.on_size)
-
-        self.autostart_var = tk.BooleanVar(value=autostart_enabled())
-        self._check(right, "Start with Windows", self.autostart_var, self.on_autostart).pack(anchor="w", pady=(6, 0))
-        tk.Button(right, text="Repair camera", command=self.on_repair, font=("Segoe UI", 9),
-                  bg="#24324a", fg=FG, activebackground="#31425f", activeforeground=FG,
-                  relief="flat", padx=10, pady=3).pack(anchor="w", pady=(8, 0))
-
-        self.phone_widgets = []
-        self._collect_phone_widgets(phone)
-
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.tick()
-
-    # ---- small widget helpers
-
-    def _row(self, parent, label):
-        tk = self.tk
-        row = tk.Frame(parent, bg=self.PANEL)
-        row.pack(fill="x", pady=3)
-        tk.Label(row, text=label, width=11, anchor="w", font=("Segoe UI", 9), bg=self.PANEL,
-                 fg=self.DIM).pack(side="left")
-        return row
-
-    def _toggle_button(self, parent, text, var, value, command):
-        return self.tk.Radiobutton(
-            parent, text=text, variable=var, value=value, command=command, indicatoron=0,
-            font=("Segoe UI", 9, "bold"), width=6, bg="#24324a", fg=self.FG, selectcolor=self.ACCENT,
-            activebackground="#31425f", activeforeground=self.FG, relief="flat", bd=0, pady=3)
-
-    def _slider(self, parent, label, var, lo, hi, step, command):
-        from tkinter import ttk
-        row = self._row(parent, label)
-        value_label = self.tk.Label(row, width=5, anchor="e", font=("Segoe UI", 9), bg=self.PANEL, fg=self.FG)
-
-        def show(*_):
-            value_label.configure(text="%.1f" % var.get())
-
-        def moved(v):
-            v = round(float(v) / step) * step
-            show()
-            command(v)
-
-        scale = ttk.Scale(row, variable=var, from_=lo, to=hi, orient="horizontal", length=170,
-                          command=moved, style="Akrem.Horizontal.TScale")
-        scale.pack(side="left")
-        value_label.pack(side="left", padx=(6, 0))
-        var.trace_add("write", show)
-        show()
-        return scale
-
-    def _check(self, parent, text, var, command):
-        return self.tk.Checkbutton(parent, text=text, variable=var, command=command, bg=self.PANEL,
-                                   fg=self.FG, selectcolor="#24324a", activebackground=self.PANEL,
-                                   activeforeground=self.FG, font=("Segoe UI", 9), bd=0,
-                                   highlightthickness=0)
-
-    def _collect_phone_widgets(self, frame):
-        for child in frame.winfo_children():
-            cls = child.winfo_class()
-            if cls in ("Radiobutton", "TScale", "Checkbutton", "TCombobox", "Button"):
-                self.phone_widgets.append(child)
-            self._collect_phone_widgets(child)
-
-    # ---- sending settings to the iPhone
-
-    def command(self, key, throttle=False, **values):
-        self.touched[key] = time.monotonic()
-        if not throttle:
-            self.link.send_command(**values)
-            return
-        first = key not in self.pending
-        self.pending[key] = values
-        if first:
-            self.root.after(70, lambda: self._flush(key))
-
-    def slider_moved(self, key, value):
-        # Ignore the echo when we moved the slider ourselves to show the iPhone's value.
-        if abs(self.synced.get(key, 1e9) - value) < 1e-6:
-            return
-        self.synced.pop(key, None)
-        self.command(key, throttle=True, **{key: value})
-
-    def _flush(self, key):
-        values = self.pending.pop(key, None)
-        if values:
-            self.link.send_command(**values)
-
-    def _recent(self, key):
-        return time.monotonic() - self.touched.get(key, 0) < 1.5
-
-    def sync_from_phone(self, info):
-        """Shows the iPhone's current settings (unless the user is changing them right now)."""
-        if not info:
-            return
-        if not self._recent("side") and info.get("camera"):
-            self.side_var.set(info["camera"])
-        lenses = info.get("lenses") or []
-        if lenses != self.lens_names:
-            self.lens_names = lenses
-            for b in self.lens_buttons:
-                b.destroy()
-            self.lens_buttons = []
-            for name in lenses:
-                b = self._toggle_button(self.lens_row, name, self.lens_var, name,
-                                        lambda n=name: self.command("lens", lens=n))
-                b.pack(side="left", padx=(0, 4))
-                self.lens_buttons.append(b)
-        if not self._recent("lens") and info.get("lens"):
-            self.lens_var.set(info["lens"])
-        max_zoom = float(info.get("maxZoom") or 1.0)
-        self.zoom_scale.configure(to=max(1.1, max_zoom))
-        for key, var in (("zoom", self.zoom_var), ("exposure", self.exposure_var)):
-            if not self._recent(key) and key in info:
-                value = round(float(info[key]), 1)
-                if abs(var.get() - value) > 1e-6:
-                    self.synced[key] = value
-                    var.set(value)
-        if not self._recent("quality") and info.get("quality"):
-            self.quality_var.set(info["quality"])
-        if not self._recent("fps") and info.get("fps"):
-            self.fps_var.set(str(info["fps"]))
-        if not self._recent("orientation") and info.get("orientation"):
-            self.rotation_var.set(info["orientation"])
-        if not self._recent("mirror") and "mirror" in info:
-            self.mirror_var.set(bool(info["mirror"]))
-        if not self._recent("torch") and "torch" in info:
-            self.torch_var.set(bool(info["torch"]))
-        if not self._recent("screenOff") and "screenOff" in info:
-            self.screen_var.set(bool(info["screenOff"]))
-        self.torch_check.configure(state="normal" if info.get("torchAvailable") else "disabled")
-
-    def set_controls_enabled(self, enabled):
-        state = "normal" if enabled else "disabled"
-        for w in self.phone_widgets + self.lens_buttons:
-            try:
-                if w.winfo_class() == "TScale":
-                    w.state(["!disabled"] if enabled else ["disabled"])
-                else:
-                    w.configure(state="readonly" if (enabled and w.winfo_class() == "TCombobox") else state)
-            except Exception:
-                pass
-
-    # ---- PC settings
-
-    def on_size(self, _event=None):
-        value = self.size_var.get()
-        if value in OUTPUT_SIZES:
-            self.settings.output = value
-            self.settings.save()
-            self.pump.resize(OUTPUT_SIZES[value])
-
-    def on_autostart(self):
-        from tkinter import messagebox
-        if not set_autostart(self.autostart_var.get()):
-            self.autostart_var.set(autostart_enabled())
-            messagebox.showinfo(APP_NAME, "This option only works in the installed AkremCam.exe.")
-
-    def on_repair(self):
-        from tkinter import messagebox
-        ok = install_camera(force=True)
-        if ok:
-            messagebox.showinfo(APP_NAME, "Camera repaired. Restart Zoom / Telegram / OBS so they see it.")
-        else:
-            messagebox.showwarning(APP_NAME, "The camera could not be installed. "
-                                             "Click Repair again and choose \"Yes\" when Windows asks.")
-
-    def on_close(self):
-        self.link.stop()
-        self.pump.stop()
-        self.root.after(300, self.root.destroy)
-
-    # ---- refresh loop
-
-    def tick(self):
-        state, status, detail, info = self.link.snapshot()
-        if self.pump.error:
-            state, status, detail = "error", "Camera problem", self.pump.error
-
-        colors = {"connected": "#27c46b", "waiting": "#f0a020", "error": "#e5484d"}
-        self.dot.itemconfigure(self.dot_id, fill=colors.get(state, "#f0a020"))
-        self.status.configure(text=status)
-        self.detail.configure(text=detail)
-
-        connected = state == "connected" and bool(info)
-        parts = []
-        if state == "connected":
-            parts.append("%d fps" % self.pump.fps)
-            if info.get("width"):
-                parts.append("%s×%s from iPhone" % (info["width"], info["height"]))
-            if info.get("device"):
-                parts.append(str(info["device"]))
-        parts.append("in use by an app" if self.pump.in_use else "not in use by any app yet")
-        self.stats.configure(text="  •  ".join(parts))
-
-        warnings = []
-        if info.get("hot"):
-            warnings.append("iPhone is hot — take it out of its case or choose 30 fps.")
-        if info.get("fps") and info.get("actualFps") and info["actualFps"] < info["fps"]:
-            warnings.append("This camera can't do %s fps; using %s." % (info["fps"], info["actualFps"]))
-        self.warning.configure(text="  ".join(warnings))
-
-        self.set_controls_enabled(connected)
-        if connected:
-            self.sync_from_phone(info)
-
-        self.update_preview(state == "connected")
-        self.root.after(100, self.tick)
-
-    def update_preview(self, connected):
-        from PIL import ImageTk
-        jpeg, seq = self.slot.latest()
-        if connected and jpeg and seq != self.preview_seq:
-            self.preview_seq = seq
-            try:
-                img = Image.open(io.BytesIO(jpeg))
-                img.draft("RGB", (self.PREVIEW_W, self.PREVIEW_H))
-                img.load()
-                img = fit_to(img, self.PREVIEW_W, self.PREVIEW_H)
-            except Exception:
-                return
-        elif not connected and self.preview_seq != -2:
-            self.preview_seq = -2
-            img = make_placeholder(self.PREVIEW_W, self.PREVIEW_H, "No video yet",
-                                   "Connect your iPhone")
-        else:
-            return
-        self.photo = ImageTk.PhotoImage(img)
-        self.preview.configure(image=self.photo, width=self.PREVIEW_W, height=self.PREVIEW_H)
-
-
-# ---------------------------------------------------------------------------
-# Start-up
-# ---------------------------------------------------------------------------
 
 def setup_logging():
     path = os.path.join(virtualcam.app_data_dir(), "log.txt")
@@ -838,14 +505,18 @@ def self_test():
     test = Image.new("RGB", (1920, 1080), (200, 30, 30))
     buf = io.BytesIO()
     test.save(buf, "JPEG", quality=80)
-    bgr = jpeg_to_bgr(buf.getvalue(), 1280, 720)
+    jpeg = buf.getvalue()
+    bgr = processing.process(jpeg, 1280, 720).tobytes("raw", "BGR")
     assert len(bgr) == 1280 * 720 * 3, "wrong frame size"
     b, g, r = bgr[0], bgr[1], bgr[2]
     assert r > 150 and b < 80, "colour order wrong: %r" % ((b, g, r),)
-    portrait = Image.new("RGB", (1080, 1920), (0, 200, 0))
-    framed = fit_to(portrait, 1920, 1080)
+    lut = processing.build_lut(processing.FILTERS["Mono"])
+    framed = processing.process(jpeg, 1920, 1080, dict(processing.DEFAULT_FRAMING, rotate=90, zoom=2.0), lut)
     assert framed.size == (1920, 1080) and framed.getpixel((0, 0)) == (0, 0, 0)
-    make_placeholder(1920, 1080, "Akrem Cam", "self test")
+    processing.make_placeholder(1920, 1080, "Akrem Cam", "self test")
+    processing.make_pause_screen(framed, 1280, 720)
+    import ui  # make sure the window code at least loads
+    assert ui.App
     if sys.platform == "win32":
         cam = virtualcam.VirtualCamera(1280, 720)
         for _ in range(10):
@@ -875,6 +546,7 @@ def main():
 
     import tkinter as tk
     from tkinter import messagebox
+    import ui
 
     root = tk.Tk()
     root.withdraw()
@@ -894,18 +566,16 @@ def main():
     settings = Settings()
     slot = FrameSlot()
     link = PhoneLink(slot)
-    pump = CameraPump(slot, link, OUTPUT_SIZES[settings.output])
+    pump = CameraPump(slot, link, OUTPUT_SIZES[settings["output"]],
+                      adjust=settings["adjust"], framing=settings["framing"])
     pump.start()
     time.sleep(0.2)
     if pump.error and "already running" in pump.error:
-        messagebox.showinfo(APP_NAME, "Akrem Cam is already open.")
+        messagebox.showinfo(APP_NAME, "Akrem Cam is already open — look for its icon next to the clock.")
         return
     link.start()
 
-    App(root, settings, slot, link, pump)
-    root.deiconify()
-    if "--minimized" in args:
-        root.iconify()
+    ui.App(root, settings, slot, link, pump, core=sys.modules[__name__], start_minimized="--minimized" in args)
     root.mainloop()
     log.info("closed")
 

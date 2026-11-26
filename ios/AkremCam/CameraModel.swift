@@ -86,6 +86,60 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var screenOff = false {
         didSet { guard screenOff != oldValue else { return }; applyScreenOff(); sendInfo() }
     }
+    @Published var torchLevel: Float = 0.5 {
+        didSet { guard torchLevel != oldValue else { return }; applyTorch(); sendInfo() }
+    }
+
+    // MARK: Pro controls
+    @Published var focusManual = false {
+        didSet {
+            guard focusManual != oldValue else { return }
+            if focusManual, liveLens >= 0 { lensPosition = liveLens }
+            applyFocus(); sendInfo()
+        }
+    }
+    @Published var lensPosition: Float = 0.5 {
+        didSet { guard lensPosition != oldValue else { return }; applyFocus(); sendInfo() }
+    }
+    @Published var exposureManual = false {
+        didSet {
+            guard exposureManual != oldValue else { return }
+            if exposureManual, liveISO > 0 { iso = liveISO; shutter = liveShutter }
+            applyExposure(); sendInfo()
+        }
+    }
+    @Published var iso: Float = 100 {
+        didSet { guard iso != oldValue else { return }; applyExposure(); sendInfo() }
+    }
+    /// Shutter speed in seconds (e.g. 1/120).
+    @Published var shutter: Double = 1.0 / 60.0 {
+        didSet { guard shutter != oldValue else { return }; applyExposure(); sendInfo() }
+    }
+    @Published var whiteBalanceManual = false {
+        didSet {
+            guard whiteBalanceManual != oldValue else { return }
+            if whiteBalanceManual, liveTemperature > 0 { temperature = liveTemperature; tint = liveTint }
+            applyWhiteBalance(); sendInfo()
+        }
+    }
+    @Published var temperature: Float = 5000 {
+        didSet { guard temperature != oldValue else { return }; applyWhiteBalance(); sendInfo() }
+    }
+    @Published var tint: Float = 0 {
+        didSet { guard tint != oldValue else { return }; applyWhiteBalance(); sendInfo() }
+    }
+    @Published var stabilization = false {
+        didSet {
+            guard stabilization != oldValue else { return }
+            save()
+            stabilizationForSession = stabilization
+            sessionQueue.async { self.applyConnectionSettings() }
+            sendInfo()
+        }
+    }
+    @Published var hdr = false {
+        didSet { guard hdr != oldValue else { return }; save(); applyHDR(); sendInfo() }
+    }
 
     // MARK: Status
     @Published private(set) var availableLenses: [Lens] = [.wide]
@@ -96,6 +150,19 @@ final class CameraModel: NSObject, ObservableObject {
     @Published private(set) var fps = 0
     @Published private(set) var isHot = false
     @Published private(set) var permissionDenied = false
+    @Published private(set) var isoRange: ClosedRange<Float> = 25...1600
+    @Published private(set) var shutterRange: ClosedRange<Double> = (1.0 / 8000.0)...(1.0 / 30.0)
+    @Published private(set) var manualFocusSupported = false
+    @Published private(set) var manualExposureSupported = false
+    @Published private(set) var manualWhiteBalanceSupported = false
+    @Published private(set) var stabilizationSupported = false
+    @Published private(set) var hdrSupported = false
+    // What the camera is doing right now (in auto modes too).
+    @Published private(set) var liveISO: Float = 0
+    @Published private(set) var liveShutter: Double = 0
+    @Published private(set) var liveLens: Float = -1
+    @Published private(set) var liveTemperature: Float = 0
+    @Published private(set) var liveTint: Float = 0
 
     let session = AVCaptureSession()
     let server = StreamServer()
@@ -110,6 +177,8 @@ final class CameraModel: NSObject, ObservableObject {
     private var savedBrightness: CGFloat = 0.5
     private var currentVideoOrientation: AVCaptureVideoOrientation = .landscapeRight
     private var mirrorForSession = false
+    private var stabilizationForSession = false
+    private var liveTimer: Timer?
     private var pinchStartZoom: CGFloat = 1.0
     private var lastWidth = 0
     private var lastHeight = 0
@@ -122,6 +191,7 @@ final class CameraModel: NSObject, ObservableObject {
         super.init()
         load()
         mirrorForSession = mirror
+        stabilizationForSession = stabilization
         encoder.quality = 0.8
     }
 
@@ -159,6 +229,7 @@ final class CameraModel: NSObject, ObservableObject {
         fpsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.fps = self.server.takeSentFrameCount()
+            self.readLiveValues()
         }
 
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -218,6 +289,20 @@ final class CameraModel: NSObject, ObservableObject {
             exposureBias = min(max(Float(v), -CameraModel.exposureLimit), CameraModel.exposureLimit)
         }
         if let v = c["torch"] as? Bool { torchOn = v && torchAvailable }
+        if let v = c["torchLevel"] as? Double { torchLevel = min(max(Float(v), 0.05), 1.0) }
+        if let v = c["focusManual"] as? Bool { focusManual = v && manualFocusSupported }
+        if let v = c["lensPosition"] as? Double { lensPosition = min(max(Float(v), 0), 1) }
+        if let v = c["exposureManual"] as? Bool { exposureManual = v && manualExposureSupported }
+        if let v = c["iso"] as? Double { iso = min(max(Float(v), isoRange.lowerBound), isoRange.upperBound) }
+        if let v = c["shutter"] as? Double { shutter = min(max(v, shutterRange.lowerBound), shutterRange.upperBound) }
+        if let v = c["whiteBalanceManual"] as? Bool { whiteBalanceManual = v && manualWhiteBalanceSupported }
+        if let v = c["temperature"] as? Double { temperature = min(max(Float(v), 2000), 10000) }
+        if let v = c["tint"] as? Double { tint = min(max(Float(v), -150), 150) }
+        if let v = c["stabilization"] as? Bool { stabilization = v && stabilizationSupported }
+        if let v = c["hdr"] as? Bool { hdr = v && hdrSupported }
+        if c["resetPro"] != nil {
+            focusManual = false; exposureManual = false; whiteBalanceManual = false; exposureBias = 0
+        }
         if let v = c["mirror"] as? Bool { mirror = v }
         if let v = c["screenOff"] as? Bool { screenOff = v }
         if c["focusCenter"] != nil { focus(at: CGPoint(x: 0.5, y: 0.5)) }
@@ -324,6 +409,15 @@ final class CameraModel: NSObject, ObservableObject {
 
         let maxZ = min(device.activeFormat.videoMaxZoomFactor, CameraModel.zoomLimit)
         let hasTorch = device.hasTorch
+        let format = device.activeFormat
+        let isoLow = format.minISO, isoHigh = format.maxISO
+        let shutterLow = max(CMTimeGetSeconds(format.minExposureDuration), 1.0 / 10000.0)
+        let shutterHigh = min(CMTimeGetSeconds(format.maxExposureDuration), 1.0 / Double(chosenRate))
+        let canFocus = device.isLockingFocusWithCustomLensPositionSupported && device.isFocusModeSupported(.locked)
+        let canExpose = device.isExposureModeSupported(.custom)
+        let canWB = device.isLockingWhiteBalanceWithCustomDeviceGainsSupported
+        let canHDR = format.isVideoHDRSupported
+        let canStabilize = videoOutput.connection(with: .video)?.isVideoStabilizationSupported ?? false
 
         if !session.isRunning {
             session.startRunning()
@@ -332,12 +426,26 @@ final class CameraModel: NSObject, ObservableObject {
         DispatchQueue.main.async {
             self.actualFrameRate = chosenRate
             self.maxZoom = max(1.0, maxZ)
+            if isoLow < isoHigh { self.isoRange = isoLow...isoHigh }
+            if shutterLow < shutterHigh { self.shutterRange = shutterLow...shutterHigh }
+            self.manualFocusSupported = canFocus
+            self.manualExposureSupported = canExpose
+            self.manualWhiteBalanceSupported = canWB
+            self.hdrSupported = canHDR
+            self.stabilizationSupported = canStabilize
+            if !canFocus { self.focusManual = false }
+            if !canExpose { self.exposureManual = false }
+            if !canWB { self.whiteBalanceManual = false }
+            if !canHDR { self.hdr = false }
             self.torchAvailable = hasTorch
             if !hasTorch { self.torchOn = false }
             if self.zoom > self.maxZoom { self.zoom = 1.0 }
             // A new camera starts at its defaults: re-apply the current adjustments.
             self.applyZoom()
             self.applyExposure()
+            self.applyFocus()
+            self.applyWhiteBalance()
+            self.applyHDR()
             self.applyTorch()
             self.sendInfo()
         }
@@ -370,7 +478,8 @@ final class CameraModel: NSObject, ObservableObject {
             conn.isVideoMirrored = mirrorForSession
         }
         if conn.isVideoStabilizationSupported {
-            conn.preferredVideoStabilizationMode = .off // lowest delay
+            // Off = lowest delay. Standard smooths shaky video but adds a little delay.
+            conn.preferredVideoStabilizationMode = stabilizationForSession ? .standard : .off
         }
     }
 
@@ -397,21 +506,98 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func applyExposure() {
-        let wanted = exposureBias
+        let manual = exposureManual, wantedISO = iso, wantedShutter = shutter, bias = exposureBias
         withDevice { device in
-            let value = min(max(wanted, device.minExposureTargetBias), device.maxExposureTargetBias)
-            device.setExposureTargetBias(value, completionHandler: nil)
+            if manual, device.isExposureModeSupported(.custom) {
+                let format = device.activeFormat
+                let isoValue = min(max(wantedISO, format.minISO), format.maxISO)
+                let longest = min(CMTimeGetSeconds(format.maxExposureDuration),
+                                  CMTimeGetSeconds(device.activeVideoMaxFrameDuration))
+                let shortest = CMTimeGetSeconds(format.minExposureDuration)
+                let seconds = min(max(wantedShutter, shortest), max(shortest, longest))
+                device.setExposureModeCustom(duration: CMTime(seconds: seconds, preferredTimescale: 1_000_000),
+                                             iso: isoValue, completionHandler: nil)
+            } else {
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
+                let value = min(max(bias, device.minExposureTargetBias), device.maxExposureTargetBias)
+                device.setExposureTargetBias(value, completionHandler: nil)
+            }
+        }
+    }
+
+    private func applyFocus() {
+        let manual = focusManual, position = lensPosition
+        withDevice { device in
+            if manual, device.isLockingFocusWithCustomLensPositionSupported, device.isFocusModeSupported(.locked) {
+                device.setFocusModeLocked(lensPosition: min(max(position, 0), 1), completionHandler: nil)
+            } else if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+        }
+    }
+
+    private func applyWhiteBalance() {
+        let manual = whiteBalanceManual, temp = temperature, tintValue = tint
+        withDevice { device in
+            if manual, device.isLockingWhiteBalanceWithCustomDeviceGainsSupported {
+                let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: temp, tint: tintValue)
+                var gains = device.deviceWhiteBalanceGains(for: values)
+                let top = device.maxWhiteBalanceGain
+                gains.redGain = min(max(gains.redGain, 1), top)
+                gains.greenGain = min(max(gains.greenGain, 1), top)
+                gains.blueGain = min(max(gains.blueGain, 1), top)
+                device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+            } else if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                device.whiteBalanceMode = .continuousAutoWhiteBalance
+            }
+        }
+    }
+
+    private func applyHDR() {
+        let on = hdr
+        withDevice { device in
+            guard device.activeFormat.isVideoHDRSupported else { return }
+            device.automaticallyAdjustsVideoHDREnabled = false
+            device.isVideoHDREnabled = on
         }
     }
 
     private func applyTorch() {
-        let on = torchOn
+        let on = torchOn, level = torchLevel
         withDevice { device in
             guard device.hasTorch, device.isTorchAvailable else { return }
             if on {
-                try? device.setTorchModeOn(level: 0.5)
+                try? device.setTorchModeOn(level: min(max(level, 0.05), 1.0))
             } else if device.torchMode != .off {
                 device.torchMode = .off
+            }
+        }
+    }
+
+    /// Reads what the camera is doing right now (ISO, shutter, focus, colour) for display.
+    private func readLiveValues() {
+        guard isConnected || !screenOff else { return }
+        sessionQueue.async {
+            guard let device = self.videoInput?.device else { return }
+            let isoNow = device.iso
+            let shutterNow = CMTimeGetSeconds(device.exposureDuration)
+            let lensNow = device.lensPosition
+            var tempNow: Float = 0, tintNow: Float = 0
+            let gains = device.deviceWhiteBalanceGains
+            if gains.redGain >= 1, gains.greenGain >= 1, gains.blueGain >= 1 {
+                let tt = device.temperatureAndTintValues(for: gains)
+                tempNow = tt.temperature
+                tintNow = tt.tint
+            }
+            DispatchQueue.main.async {
+                self.liveISO = isoNow
+                self.liveShutter = shutterNow.isFinite ? shutterNow : 0
+                self.liveLens = lensNow
+                self.liveTemperature = tempNow
+                self.liveTint = tintNow
+                if self.isConnected { self.sendInfo() }
             }
         }
     }
@@ -507,6 +693,31 @@ final class CameraModel: NSObject, ObservableObject {
             "mirror": mirror,
             "screenOff": screenOff,
             "hot": isHot,
+            "torchLevel": Double(torchLevel),
+            "focusManual": focusManual,
+            "lensPosition": Double(lensPosition),
+            "manualFocusSupported": manualFocusSupported,
+            "exposureManual": exposureManual,
+            "iso": Double(iso),
+            "shutter": shutter,
+            "isoMin": Double(isoRange.lowerBound),
+            "isoMax": Double(isoRange.upperBound),
+            "shutterMin": shutterRange.lowerBound,
+            "shutterMax": shutterRange.upperBound,
+            "manualExposureSupported": manualExposureSupported,
+            "whiteBalanceManual": whiteBalanceManual,
+            "temperature": Double(temperature),
+            "tint": Double(tint),
+            "manualWhiteBalanceSupported": manualWhiteBalanceSupported,
+            "stabilization": stabilization,
+            "stabilizationSupported": stabilizationSupported,
+            "hdr": hdr,
+            "hdrSupported": hdrSupported,
+            "liveISO": Double(liveISO),
+            "liveShutter": liveShutter,
+            "liveLens": Double(liveLens),
+            "liveTemperature": Double(liveTemperature),
+            "liveTint": Double(liveTint),
         ]
         if lastWidth > 0 {
             info["width"] = lastWidth
@@ -525,6 +736,8 @@ final class CameraModel: NSObject, ObservableObject {
         d.set(frameRate.rawValue, forKey: "fps")
         d.set(orientationMode.rawValue, forKey: "orientation")
         d.set(mirror, forKey: "mirror")
+        d.set(stabilization, forKey: "stabilization")
+        d.set(hdr, forKey: "hdr")
     }
 
     private func load() {
@@ -535,6 +748,8 @@ final class CameraModel: NSObject, ObservableObject {
         if let f = FrameRate(rawValue: d.integer(forKey: "fps")) { frameRate = f }
         if let v = d.string(forKey: "orientation"), let o = OrientationMode(rawValue: v) { orientationMode = o }
         mirror = d.bool(forKey: "mirror")
+        stabilization = d.bool(forKey: "stabilization")
+        hdr = d.bool(forKey: "hdr")
     }
 }
 

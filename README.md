@@ -23,6 +23,18 @@ Both files are on the **Releases** page → `latest`:
 3. **Run `AkremCam.exe`** on the PC. The first time, Windows asks for permission to install
    the webcam — click **Yes**. (If Windows SmartScreen appears: *More info → Run anyway*.)
 
+## What you can control (from the PC window)
+
+- **iPhone camera (left side):** Back/Front, lens (0.5x / 1x / Zoom), zoom, exposure (auto + brightness, or
+  manual ISO + shutter speed), focus (auto, or manual distance), white balance (auto, or manual temperature
+  + tint), flash light + strength, 720p/1080p, 30/60 fps, stabilization, HDR, dark iPhone screen.
+- **Picture (right side):** filters (Vivid, Warm, Cool, Bright, Soft, Mono), brightness, contrast,
+  saturation, warmth, tint, digital zoom (drag the preview to move, scroll to zoom), rotate, mirror, flip,
+  webcam output size.
+- **Top bar:** profiles, **Pause** (others see a "Camera paused" screen) and **Record** (saved to
+  Videos\Akrem Cam). Shortcuts: Ctrl+P pause, Ctrl+R record.
+- Closing the window keeps the camera running — the icon next to the clock opens it again or quits.
+
 ## Every day
 
 1. Plug in the iPhone, open **Akrem Cam** on it.
