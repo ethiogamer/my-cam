@@ -24,6 +24,7 @@ PHONE_PORT = 7878
 MAGIC = b"AKC1"
 MSG_JPEG = 1
 MSG_INFO = 2
+MSG_COMMAND = 3
 OUTPUT_SIZES = {"1080p": (1920, 1080), "720p": (1280, 720)}
 
 log = logging.getLogger("akremcam")
@@ -118,6 +119,21 @@ class PhoneLink(threading.Thread):
         self.state = "waiting"  # waiting | connected | error
         self.info = {}
         self._sock = None
+        self._send_lock = threading.Lock()
+
+    def send_command(self, **command):
+        """Sends a setting change to the iPhone, e.g. send_command(zoom=2.0)."""
+        sock = self._sock
+        if sock is None:
+            return False
+        payload = json.dumps(command).encode("utf-8")
+        data = MAGIC + struct.pack(">II", MSG_COMMAND, len(payload)) + payload
+        try:
+            with self._send_lock:
+                sock.sendall(data)
+            return True
+        except OSError:
+            return False
 
     def _set(self, state, status, detail=""):
         with self.lock:
@@ -368,7 +384,8 @@ def resource(name):
 
 
 class App:
-    PREVIEW_W, PREVIEW_H = 480, 270
+    PREVIEW_W, PREVIEW_H = 560, 315
+    BG, PANEL, FG, DIM, ACCENT = "#0f1623", "#172133", "#eef2fa", "#93a1bd", "#f5c518"
 
     def __init__(self, root, settings, slot, link, pump):
         import tkinter as tk
@@ -382,9 +399,14 @@ class App:
         self.pump = pump
         self.preview_seq = -1
         self.photo = None
+        self.touched = {}        # control -> time the user last moved it
+        self.pending = {}        # throttled commands waiting to be sent
+        self.lens_buttons = []
+        self.lens_names = []
+        self.synced = {}         # slider -> value last shown from the iPhone
 
         root.title(APP_NAME)
-        root.configure(bg="#0f1623")
+        root.configure(bg=self.BG)
         root.resizable(False, False)
         try:
             root.iconbitmap(resource("icon.ico"))
@@ -396,54 +418,268 @@ class App:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("TCombobox", padding=4)
+        style.configure("TCombobox", padding=3)
+        style.configure("Akrem.Horizontal.TScale", background=self.ACCENT, troughcolor="#24324a",
+                        bordercolor=self.PANEL, lightcolor=self.ACCENT, darkcolor=self.ACCENT,
+                        sliderlength=16)
 
-        bg, fg, dim = "#0f1623", "#eef2fa", "#93a1bd"
-        outer = tk.Frame(root, bg=bg, padx=18, pady=16)
+        BG, FG, DIM = self.BG, self.FG, self.DIM
+        outer = tk.Frame(root, bg=BG, padx=18, pady=16)
         outer.pack(fill="both", expand=True)
 
-        tk.Label(outer, text=APP_NAME, font=("Segoe UI", 18, "bold"), bg=bg, fg=fg).pack(anchor="w")
-        tk.Label(outer, text="Your iPhone as a webcam — over the USB cable", font=("Segoe UI", 10),
-                 bg=bg, fg=dim).pack(anchor="w", pady=(0, 10))
+        # ---- left: preview + status
+        left = tk.Frame(outer, bg=BG)
+        left.pack(side="left", fill="y")
 
-        self.preview = tk.Label(outer, bg="#000000", width=self.PREVIEW_W, height=self.PREVIEW_H)
+        tk.Label(left, text=APP_NAME, font=("Segoe UI", 18, "bold"), bg=BG, fg=FG).pack(anchor="w")
+        tk.Label(left, text="Your iPhone as a webcam — over the USB cable", font=("Segoe UI", 10),
+                 bg=BG, fg=DIM).pack(anchor="w", pady=(0, 10))
+
+        self.preview = tk.Label(left, bg="#000000", width=self.PREVIEW_W, height=self.PREVIEW_H)
         self.preview.pack()
 
-        status_row = tk.Frame(outer, bg=bg)
+        status_row = tk.Frame(left, bg=BG)
         status_row.pack(fill="x", pady=(12, 0))
-        self.dot = tk.Canvas(status_row, width=14, height=14, bg=bg, highlightthickness=0)
+        self.dot = tk.Canvas(status_row, width=14, height=14, bg=BG, highlightthickness=0)
         self.dot.pack(side="left", padx=(0, 8))
         self.dot_id = self.dot.create_oval(2, 2, 13, 13, fill="#f0a020", outline="")
         self.status = tk.Label(status_row, text="Starting…", font=("Segoe UI", 12, "bold"),
-                               bg=bg, fg=fg, anchor="w")
+                               bg=BG, fg=FG, anchor="w")
         self.status.pack(side="left", fill="x")
 
-        self.detail = tk.Label(outer, text="", font=("Segoe UI", 9), bg=bg, fg=dim, anchor="w",
+        self.detail = tk.Label(left, text="", font=("Segoe UI", 9), bg=BG, fg=DIM, anchor="w",
                                justify="left", wraplength=self.PREVIEW_W)
         self.detail.pack(fill="x", pady=(2, 0))
-        self.stats = tk.Label(outer, text="", font=("Segoe UI", 9), bg=bg, fg=dim, anchor="w")
-        self.stats.pack(fill="x", pady=(2, 10))
+        self.stats = tk.Label(left, text="", font=("Segoe UI", 9), bg=BG, fg=DIM, anchor="w")
+        self.stats.pack(fill="x", pady=(2, 0))
+        self.warning = tk.Label(left, text="", font=("Segoe UI", 9, "bold"), bg=BG, fg="#f0a020", anchor="w")
+        self.warning.pack(fill="x")
 
-        row = tk.Frame(outer, bg=bg)
-        row.pack(fill="x")
-        tk.Label(row, text="Webcam size:", font=("Segoe UI", 10), bg=bg, fg=fg).pack(side="left")
+        help_text = ("1. Plug the iPhone into this PC with the cable.   "
+                     "2. Open Akrem Cam on the iPhone.\n"
+                     "3. In Zoom / Telegram / OBS / Meet, choose the camera \"Akrem Cam\".")
+        tk.Label(left, text=help_text, font=("Segoe UI", 9), bg=BG, fg=DIM, justify="left",
+                 anchor="w").pack(fill="x", pady=(10, 0))
+
+        # ---- right: iPhone controls
+        right = tk.Frame(outer, bg=self.PANEL, padx=14, pady=12)
+        right.pack(side="left", fill="y", padx=(16, 0))
+        self.controls_frame = right
+
+        tk.Label(right, text="iPhone camera", font=("Segoe UI", 12, "bold"), bg=self.PANEL,
+                 fg=FG).pack(anchor="w", pady=(0, 8))
+
+        phone = tk.Frame(right, bg=self.PANEL)
+        phone.pack(fill="x")
+        self.phone_frame = phone
+
+        self.side_var = tk.StringVar(value="Back")
+        row = self._row(phone, "Camera")
+        for name in ("Back", "Front"):
+            self._toggle_button(row, name, self.side_var, name,
+                                lambda n=name: self.command("side", side=n)).pack(side="left", padx=(0, 4))
+
+        self.lens_row = self._row(phone, "Lens")
+        self.lens_var = tk.StringVar(value="1x")
+
+        self.zoom_var = tk.DoubleVar(value=1.0)
+        self.zoom_scale = self._slider(phone, "Zoom", self.zoom_var, 1.0, 10.0, 0.1,
+                                       lambda v: self.slider_moved("zoom", float(v)))
+
+        self.exposure_var = tk.DoubleVar(value=0.0)
+        self._slider(phone, "Brightness", self.exposure_var, -2.0, 2.0, 0.1,
+                     lambda v: self.slider_moved("exposure", float(v)))
+
+        self.quality_var = tk.StringVar(value="1080p")
+        row = self._row(phone, "Quality")
+        for q in ("720p", "1080p"):
+            self._toggle_button(row, q, self.quality_var, q,
+                                lambda q=q: self.command("quality", quality=q)).pack(side="left", padx=(0, 4))
+
+        self.fps_var = tk.StringVar(value="30")
+        row = self._row(phone, "Smoothness")
+        for f in ("30", "60"):
+            self._toggle_button(row, f + " fps", self.fps_var, f,
+                                lambda f=f: self.command("fps", fps=int(f))).pack(side="left", padx=(0, 4))
+
+        self.rotation_var = tk.StringVar(value="Auto")
+        row = self._row(phone, "Rotation")
+        rot = ttk.Combobox(row, textvariable=self.rotation_var, state="readonly", width=18,
+                           values=["Auto", "Landscape", "Landscape (flipped)", "Portrait"])
+        rot.pack(side="left")
+        rot.bind("<<ComboboxSelected>>",
+                 lambda e: self.command("orientation", orientation=self.rotation_var.get()))
+
+        checks = tk.Frame(phone, bg=self.PANEL)
+        checks.pack(fill="x", pady=(8, 0))
+        self.mirror_var = tk.BooleanVar(value=False)
+        self.torch_var = tk.BooleanVar(value=False)
+        self.screen_var = tk.BooleanVar(value=False)
+        self._check(checks, "Mirror picture", self.mirror_var,
+                    lambda: self.command("mirror", mirror=self.mirror_var.get())).pack(anchor="w")
+        self.torch_check = self._check(checks, "iPhone light (flash)", self.torch_var,
+                                       lambda: self.command("torch", torch=self.torch_var.get()))
+        self.torch_check.pack(anchor="w")
+        self._check(checks, "Dark iPhone screen (saves battery)", self.screen_var,
+                    lambda: self.command("screenOff", screenOff=self.screen_var.get())).pack(anchor="w")
+
+        tk.Button(phone, text="Focus on centre", command=lambda: self.command("focus", focusCenter=True),
+                  font=("Segoe UI", 9), bg="#24324a", fg=FG, activebackground="#31425f",
+                  activeforeground=FG, relief="flat", padx=10, pady=3).pack(anchor="w", pady=(8, 0))
+
+        # ---- PC settings
+        tk.Frame(right, bg="#2a3850", height=1).pack(fill="x", pady=12)
+        tk.Label(right, text="This PC", font=("Segoe UI", 12, "bold"), bg=self.PANEL,
+                 fg=FG).pack(anchor="w", pady=(0, 6))
+        row = self._row(right, "Webcam size")
         self.size_var = tk.StringVar(value=settings.output)
         combo = ttk.Combobox(row, textvariable=self.size_var, values=list(OUTPUT_SIZES),
                              state="readonly", width=8)
-        combo.pack(side="left", padx=8)
+        combo.pack(side="left")
         combo.bind("<<ComboboxSelected>>", self.on_size)
-        tk.Button(row, text="Repair camera", command=self.on_repair, font=("Segoe UI", 9),
-                  bg="#24324a", fg=fg, activebackground="#31425f", activeforeground=fg,
-                  relief="flat", padx=10, pady=3).pack(side="right")
 
-        help_text = ("1. Plug the iPhone into this PC with the cable.\n"
-                     "2. Open the Akrem Cam app on the iPhone.\n"
-                     "3. In Zoom / Telegram / OBS / Meet, choose the camera \"Akrem Cam\".")
-        tk.Label(outer, text=help_text, font=("Segoe UI", 9), bg=bg, fg=dim, justify="left",
-                 anchor="w").pack(fill="x", pady=(12, 0))
+        self.autostart_var = tk.BooleanVar(value=autostart_enabled())
+        self._check(right, "Start with Windows", self.autostart_var, self.on_autostart).pack(anchor="w", pady=(6, 0))
+        tk.Button(right, text="Repair camera", command=self.on_repair, font=("Segoe UI", 9),
+                  bg="#24324a", fg=FG, activebackground="#31425f", activeforeground=FG,
+                  relief="flat", padx=10, pady=3).pack(anchor="w", pady=(8, 0))
+
+        self.phone_widgets = []
+        self._collect_phone_widgets(phone)
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.tick()
+
+    # ---- small widget helpers
+
+    def _row(self, parent, label):
+        tk = self.tk
+        row = tk.Frame(parent, bg=self.PANEL)
+        row.pack(fill="x", pady=3)
+        tk.Label(row, text=label, width=11, anchor="w", font=("Segoe UI", 9), bg=self.PANEL,
+                 fg=self.DIM).pack(side="left")
+        return row
+
+    def _toggle_button(self, parent, text, var, value, command):
+        return self.tk.Radiobutton(
+            parent, text=text, variable=var, value=value, command=command, indicatoron=0,
+            font=("Segoe UI", 9, "bold"), width=6, bg="#24324a", fg=self.FG, selectcolor=self.ACCENT,
+            activebackground="#31425f", activeforeground=self.FG, relief="flat", bd=0, pady=3)
+
+    def _slider(self, parent, label, var, lo, hi, step, command):
+        from tkinter import ttk
+        row = self._row(parent, label)
+        value_label = self.tk.Label(row, width=5, anchor="e", font=("Segoe UI", 9), bg=self.PANEL, fg=self.FG)
+
+        def show(*_):
+            value_label.configure(text="%.1f" % var.get())
+
+        def moved(v):
+            v = round(float(v) / step) * step
+            show()
+            command(v)
+
+        scale = ttk.Scale(row, variable=var, from_=lo, to=hi, orient="horizontal", length=170,
+                          command=moved, style="Akrem.Horizontal.TScale")
+        scale.pack(side="left")
+        value_label.pack(side="left", padx=(6, 0))
+        var.trace_add("write", show)
+        show()
+        return scale
+
+    def _check(self, parent, text, var, command):
+        return self.tk.Checkbutton(parent, text=text, variable=var, command=command, bg=self.PANEL,
+                                   fg=self.FG, selectcolor="#24324a", activebackground=self.PANEL,
+                                   activeforeground=self.FG, font=("Segoe UI", 9), bd=0,
+                                   highlightthickness=0)
+
+    def _collect_phone_widgets(self, frame):
+        for child in frame.winfo_children():
+            cls = child.winfo_class()
+            if cls in ("Radiobutton", "TScale", "Checkbutton", "TCombobox", "Button"):
+                self.phone_widgets.append(child)
+            self._collect_phone_widgets(child)
+
+    # ---- sending settings to the iPhone
+
+    def command(self, key, throttle=False, **values):
+        self.touched[key] = time.monotonic()
+        if not throttle:
+            self.link.send_command(**values)
+            return
+        first = key not in self.pending
+        self.pending[key] = values
+        if first:
+            self.root.after(70, lambda: self._flush(key))
+
+    def slider_moved(self, key, value):
+        # Ignore the echo when we moved the slider ourselves to show the iPhone's value.
+        if abs(self.synced.get(key, 1e9) - value) < 1e-6:
+            return
+        self.synced.pop(key, None)
+        self.command(key, throttle=True, **{key: value})
+
+    def _flush(self, key):
+        values = self.pending.pop(key, None)
+        if values:
+            self.link.send_command(**values)
+
+    def _recent(self, key):
+        return time.monotonic() - self.touched.get(key, 0) < 1.5
+
+    def sync_from_phone(self, info):
+        """Shows the iPhone's current settings (unless the user is changing them right now)."""
+        if not info:
+            return
+        if not self._recent("side") and info.get("camera"):
+            self.side_var.set(info["camera"])
+        lenses = info.get("lenses") or []
+        if lenses != self.lens_names:
+            self.lens_names = lenses
+            for b in self.lens_buttons:
+                b.destroy()
+            self.lens_buttons = []
+            for name in lenses:
+                b = self._toggle_button(self.lens_row, name, self.lens_var, name,
+                                        lambda n=name: self.command("lens", lens=n))
+                b.pack(side="left", padx=(0, 4))
+                self.lens_buttons.append(b)
+        if not self._recent("lens") and info.get("lens"):
+            self.lens_var.set(info["lens"])
+        max_zoom = float(info.get("maxZoom") or 1.0)
+        self.zoom_scale.configure(to=max(1.1, max_zoom))
+        for key, var in (("zoom", self.zoom_var), ("exposure", self.exposure_var)):
+            if not self._recent(key) and key in info:
+                value = round(float(info[key]), 1)
+                if abs(var.get() - value) > 1e-6:
+                    self.synced[key] = value
+                    var.set(value)
+        if not self._recent("quality") and info.get("quality"):
+            self.quality_var.set(info["quality"])
+        if not self._recent("fps") and info.get("fps"):
+            self.fps_var.set(str(info["fps"]))
+        if not self._recent("orientation") and info.get("orientation"):
+            self.rotation_var.set(info["orientation"])
+        if not self._recent("mirror") and "mirror" in info:
+            self.mirror_var.set(bool(info["mirror"]))
+        if not self._recent("torch") and "torch" in info:
+            self.torch_var.set(bool(info["torch"]))
+        if not self._recent("screenOff") and "screenOff" in info:
+            self.screen_var.set(bool(info["screenOff"]))
+        self.torch_check.configure(state="normal" if info.get("torchAvailable") else "disabled")
+
+    def set_controls_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+        for w in self.phone_widgets + self.lens_buttons:
+            try:
+                if w.winfo_class() == "TScale":
+                    w.state(["!disabled"] if enabled else ["disabled"])
+                else:
+                    w.configure(state="readonly" if (enabled and w.winfo_class() == "TCombobox") else state)
+            except Exception:
+                pass
+
+    # ---- PC settings
 
     def on_size(self, _event=None):
         value = self.size_var.get()
@@ -451,6 +687,12 @@ class App:
             self.settings.output = value
             self.settings.save()
             self.pump.resize(OUTPUT_SIZES[value])
+
+    def on_autostart(self):
+        from tkinter import messagebox
+        if not set_autostart(self.autostart_var.get()):
+            self.autostart_var.set(autostart_enabled())
+            messagebox.showinfo(APP_NAME, "This option only works in the installed AkremCam.exe.")
 
     def on_repair(self):
         from tkinter import messagebox
@@ -466,6 +708,8 @@ class App:
         self.pump.stop()
         self.root.after(300, self.root.destroy)
 
+    # ---- refresh loop
+
     def tick(self):
         state, status, detail, info = self.link.snapshot()
         if self.pump.error:
@@ -476,16 +720,27 @@ class App:
         self.status.configure(text=status)
         self.detail.configure(text=detail)
 
+        connected = state == "connected" and bool(info)
         parts = []
         if state == "connected":
             parts.append("%d fps" % self.pump.fps)
             if info.get("width"):
                 parts.append("%s×%s from iPhone" % (info["width"], info["height"]))
-            cam = " ".join(str(info[k]) for k in ("camera", "lens") if info.get(k))
-            if cam:
-                parts.append(cam + " camera")
+            if info.get("device"):
+                parts.append(str(info["device"]))
         parts.append("in use by an app" if self.pump.in_use else "not in use by any app yet")
         self.stats.configure(text="  •  ".join(parts))
+
+        warnings = []
+        if info.get("hot"):
+            warnings.append("iPhone is hot — take it out of its case or choose 30 fps.")
+        if info.get("fps") and info.get("actualFps") and info["actualFps"] < info["fps"]:
+            warnings.append("This camera can't do %s fps; using %s." % (info["fps"], info["actualFps"]))
+        self.warning.configure(text="  ".join(warnings))
+
+        self.set_controls_enabled(connected)
+        if connected:
+            self.sync_from_phone(info)
 
         self.update_preview(state == "connected")
         self.root.after(100, self.tick)
@@ -528,6 +783,41 @@ def setup_logging():
         handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def autostart_enabled():
+    if sys.platform != "win32":
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, "AkremCam")
+        return True
+    except OSError:
+        return False
+
+
+def set_autostart(enabled):
+    """Adds/removes AkremCam from programs that start with Windows (minimised)."""
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, "AkremCam", 0, winreg.REG_SZ,
+                                  '"%s" --minimized' % sys.executable)
+            else:
+                try:
+                    winreg.DeleteValue(key, "AkremCam")
+                except OSError:
+                    pass
+        return True
+    except OSError:
+        return False
 
 
 def install_camera(force=False):
@@ -614,6 +904,8 @@ def main():
 
     App(root, settings, slot, link, pump)
     root.deiconify()
+    if "--minimized" in args:
+        root.iconify()
     root.mainloop()
     log.info("closed")
 

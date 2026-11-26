@@ -6,7 +6,7 @@ import Network
 ///
 /// Wire format (phone -> PC), every message:
 ///   4 bytes  magic "AKC1"
-///   4 bytes  type   (UInt32, big-endian)  1 = JPEG frame, 2 = JSON info
+///   4 bytes  type   (UInt32, big-endian)  1 = JPEG frame, 2 = JSON info, 3 = JSON command (PC -> phone)
 ///   4 bytes  length (UInt32, big-endian)
 ///   N bytes  payload
 final class StreamServer {
@@ -15,12 +15,17 @@ final class StreamServer {
     enum MessageType: UInt32 {
         case jpeg = 1
         case info = 2
+        case command = 3
     }
 
     /// Called (on any thread) when the PC connects or disconnects.
     var onConnectionChange: ((Bool) -> Void)?
     /// Called (on any thread) right after a PC connects, so we can send info.
     var onNewConnection: (() -> Void)?
+    /// Called (on any thread) when the PC sends a command, e.g. ["zoom": 2.0].
+    var onCommand: (([String: Any]) -> Void)?
+
+    private var inbox = Data()
 
     private let queue = DispatchQueue(label: "akremcam.server")
     private var listener: NWListener?
@@ -97,6 +102,7 @@ final class StreamServer {
         // Only one PC at a time: the newest connection wins.
         dropConnection()
         connection = conn
+        inbox = Data()
         conn.stateUpdateHandler = { [weak self, weak conn] state in
             guard let self = self, let conn = conn else { return }
             switch state {
@@ -115,18 +121,43 @@ final class StreamServer {
         conn.start(queue: queue)
     }
 
-    /// Reads (and ignores) anything the PC sends, so we notice when it disconnects.
+    /// Reads commands from the PC, and notices when it disconnects.
     private func receiveLoop(_ conn: NWConnection) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] _, _, isComplete, error in
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
-            if isComplete || error != nil {
-                self.queue.async {
-                    if self.connection === conn { self.dropConnection() }
+            if let data = data, !data.isEmpty, self.connection === conn {
+                self.inbox.append(data)
+                if !self.parseInbox() {
+                    self.dropConnection()
+                    return
                 }
+            }
+            if isComplete || error != nil {
+                if self.connection === conn { self.dropConnection() }
             } else {
                 self.receiveLoop(conn)
             }
         }
+    }
+
+    /// Returns false if the PC sent garbage.
+    private func parseInbox() -> Bool {
+        while inbox.count >= 12 {
+            let header = [UInt8](inbox.prefix(12))
+            guard header[0] == 0x41, header[1] == 0x4B, header[2] == 0x43, header[3] == 0x31 else { return false }
+            let type = UInt32(header[4]) << 24 | UInt32(header[5]) << 16 | UInt32(header[6]) << 8 | UInt32(header[7])
+            let length = Int(UInt32(header[8]) << 24 | UInt32(header[9]) << 16 | UInt32(header[10]) << 8 | UInt32(header[11]))
+            guard length <= 1_000_000 else { return false }
+            guard inbox.count >= 12 + length else { break }
+            let payload = Data(inbox.dropFirst(12).prefix(length))
+            inbox = Data(inbox.dropFirst(12 + length))
+            if type == MessageType.command.rawValue,
+               let object = try? JSONSerialization.jsonObject(with: payload),
+               let dict = object as? [String: Any] {
+                onCommand?(dict)
+            }
+        }
+        return true
     }
 
     private func dropConnection() {

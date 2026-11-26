@@ -28,6 +28,14 @@ enum VideoQuality: String, CaseIterable, Identifiable {
     case hd1080 = "1080p"
     var id: String { rawValue }
     var preset: AVCaptureSession.Preset { self == .hd720 ? .hd1280x720 : .hd1920x1080 }
+    var size: (width: Int32, height: Int32) { self == .hd720 ? (1280, 720) : (1920, 1080) }
+}
+
+enum FrameRate: Int, CaseIterable, Identifiable {
+    case fps30 = 30
+    case fps60 = 60
+    var id: Int { rawValue }
+    var label: String { "\(rawValue) fps" }
 }
 
 enum OrientationMode: String, CaseIterable, Identifiable {
@@ -49,19 +57,45 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var quality: VideoQuality = .hd1080 {
         didSet { guard quality != oldValue else { return }; save(); reconfigure() }
     }
+    @Published var frameRate: FrameRate = .fps30 {
+        didSet { guard frameRate != oldValue else { return }; save(); reconfigure() }
+    }
     @Published var orientationMode: OrientationMode = .auto {
-        didSet { guard orientationMode != oldValue else { return }; save(); applyOrientation() }
+        didSet { guard orientationMode != oldValue else { return }; save(); updateOrientationFromDevice() }
+    }
+    @Published var mirror = false {
+        didSet {
+            guard mirror != oldValue else { return }
+            save()
+            mirrorForSession = mirror
+            sessionQueue.async { self.applyConnectionSettings() }
+            sendInfo()
+        }
+    }
+
+    // MARK: Live adjustments
+    @Published var zoom: CGFloat = 1.0 {
+        didSet { guard zoom != oldValue else { return }; applyZoom(); sendInfo() }
+    }
+    @Published var exposureBias: Float = 0 {
+        didSet { guard exposureBias != oldValue else { return }; applyExposure(); sendInfo() }
+    }
+    @Published var torchOn = false {
+        didSet { guard torchOn != oldValue else { return }; applyTorch(); sendInfo() }
+    }
+    @Published var screenOff = false {
+        didSet { guard screenOff != oldValue else { return }; applyScreenOff(); sendInfo() }
     }
 
     // MARK: Status
     @Published private(set) var availableLenses: [Lens] = [.wide]
+    @Published private(set) var maxZoom: CGFloat = 1.0
+    @Published private(set) var torchAvailable = false
+    @Published private(set) var actualFrameRate = 30
     @Published private(set) var isConnected = false
     @Published private(set) var fps = 0
+    @Published private(set) var isHot = false
     @Published private(set) var permissionDenied = false
-    @Published private(set) var outputDescription = ""
-    @Published var screenOff = false {
-        didSet { applyScreenOff() }
-    }
 
     let session = AVCaptureSession()
     let server = StreamServer()
@@ -75,12 +109,19 @@ final class CameraModel: NSObject, ObservableObject {
     private var fpsTimer: Timer?
     private var savedBrightness: CGFloat = 0.5
     private var currentVideoOrientation: AVCaptureVideoOrientation = .landscapeRight
+    private var mirrorForSession = false
+    private var pinchStartZoom: CGFloat = 1.0
     private var lastWidth = 0
     private var lastHeight = 0
+    private var skipToggle = false
+
+    static let zoomLimit: CGFloat = 10.0
+    static let exposureLimit: Float = 2.0
 
     override init() {
         super.init()
         load()
+        mirrorForSession = mirror
         encoder.quality = 0.8
     }
 
@@ -100,12 +141,18 @@ final class CameraModel: NSObject, ObservableObject {
                        name: UIApplication.willEnterForegroundNotification, object: nil)
         nc.addObserver(self, selector: #selector(appDidEnterBackground),
                        name: UIApplication.didEnterBackgroundNotification, object: nil)
+        nc.addObserver(self, selector: #selector(thermalStateChanged),
+                       name: ProcessInfo.thermalStateDidChangeNotification, object: nil)
+        thermalStateChanged()
 
         server.onConnectionChange = { [weak self] connected in
             DispatchQueue.main.async { self?.isConnected = connected }
         }
         server.onNewConnection = { [weak self] in
             self?.sendInfo()
+        }
+        server.onCommand = { [weak self] command in
+            DispatchQueue.main.async { self?.handle(command: command) }
         }
         server.start()
 
@@ -144,6 +191,37 @@ final class CameraModel: NSObject, ObservableObject {
 
     @objc private func appDidEnterBackground() {
         if screenOff { screenOff = false }
+        if torchOn { torchOn = false }
+    }
+
+    @objc private func thermalStateChanged() {
+        let state = ProcessInfo.processInfo.thermalState
+        let hot = state == .serious || state == .critical
+        DispatchQueue.main.async {
+            if self.isHot != hot {
+                self.isHot = hot
+                self.sendInfo()
+            }
+        }
+    }
+
+    // MARK: - Commands from the PC
+
+    private func handle(command c: [String: Any]) {
+        if let v = c["side"] as? String, let s = CameraSide(rawValue: v) { side = s }
+        if let v = c["lens"] as? String, let l = Lens(rawValue: v), availableLenses.contains(l) { lens = l }
+        if let v = c["quality"] as? String, let q = VideoQuality(rawValue: v) { quality = q }
+        if let v = c["fps"] as? Int, let f = FrameRate(rawValue: v) { frameRate = f }
+        if let v = c["orientation"] as? String, let o = OrientationMode(rawValue: v) { orientationMode = o }
+        if let v = c["zoom"] as? Double { zoom = min(max(CGFloat(v), 1.0), maxZoom) }
+        if let v = c["exposure"] as? Double {
+            exposureBias = min(max(Float(v), -CameraModel.exposureLimit), CameraModel.exposureLimit)
+        }
+        if let v = c["torch"] as? Bool { torchOn = v && torchAvailable }
+        if let v = c["mirror"] as? Bool { mirror = v }
+        if let v = c["screenOff"] as? Bool { screenOff = v }
+        if c["focusCenter"] != nil { focus(at: CGPoint(x: 0.5, y: 0.5)) }
+        if c["getInfo"] != nil { sendInfo() }
     }
 
     // MARK: - Camera configuration
@@ -166,13 +244,30 @@ final class CameraModel: NSObject, ObservableObject {
 
     private func reconfigure() {
         guard started, !permissionDenied else { return }
-        let side = self.side, lens = self.lens, quality = self.quality
+        let side = self.side, lens = self.lens, quality = self.quality, rate = self.frameRate
         sessionQueue.async {
-            self.configureSession(side: side, lens: lens, quality: quality)
+            self.configureSession(side: side, lens: lens, quality: quality, rate: rate)
         }
     }
 
-    private func configureSession(side: CameraSide, lens: Lens, quality: VideoQuality) {
+    /// Finds a camera mode with exactly the size we want, preferring one that can do `fps`.
+    private func bestFormat(for device: AVCaptureDevice, quality: VideoQuality, fps: Int) -> AVCaptureDevice.Format? {
+        let size = quality.size
+        let matching = device.formats.filter { format in
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            let subtype = CMFormatDescriptionGetMediaSubType(format.formatDescription)
+            return dims.width == size.width && dims.height == size.height
+                && subtype == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        }
+        func supports(_ f: AVCaptureDevice.Format, _ rate: Int) -> Bool {
+            f.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= Double(rate) && Double(rate) <= $0.maxFrameRate }
+        }
+        let fast = matching.filter { supports($0, fps) }
+        return fast.first(where: { !$0.isVideoBinned }) ?? fast.first
+            ?? matching.first(where: { supports($0, 30) }) ?? matching.first
+    }
+
+    private func configureSession(side: CameraSide, lens: Lens, quality: VideoQuality, rate: FrameRate) {
         guard let device = findDevice(side: side, lens: lens) else { return }
 
         session.beginConfiguration()
@@ -186,14 +281,6 @@ final class CameraModel: NSObject, ObservableObject {
             videoInput = input
         }
 
-        if session.canSetSessionPreset(quality.preset) {
-            session.sessionPreset = quality.preset
-        } else if session.canSetSessionPreset(.hd1280x720) {
-            session.sessionPreset = .hd1280x720
-        } else {
-            session.sessionPreset = .high
-        }
-
         if !session.outputs.contains(videoOutput) {
             videoOutput.videoSettings = [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
@@ -205,42 +292,69 @@ final class CameraModel: NSObject, ObservableObject {
             }
         }
 
+        // Pick the camera mode. Holding the device lock until after commit stops the
+        // session from overriding our choice.
+        var chosenRate = 30
+        var locked = false
+        if let format = bestFormat(for: device, quality: quality, fps: rate.rawValue),
+           (try? device.lockForConfiguration()) != nil {
+            locked = true
+            device.activeFormat = format
+            let canDo = format.videoSupportedFrameRateRanges.contains {
+                $0.minFrameRate <= Double(rate.rawValue) && Double(rate.rawValue) <= $0.maxFrameRate
+            }
+            chosenRate = canDo ? rate.rawValue : 30
+            let duration = CMTime(value: 1, timescale: CMTimeScale(chosenRate))
+            device.activeVideoMinFrameDuration = duration
+            device.activeVideoMaxFrameDuration = duration
+            applyAutoModes(device)
+        } else {
+            if session.canSetSessionPreset(quality.preset) {
+                session.sessionPreset = quality.preset
+            } else if session.canSetSessionPreset(.hd1280x720) {
+                session.sessionPreset = .hd1280x720
+            } else {
+                session.sessionPreset = .high
+            }
+        }
+
         applyConnectionSettings()
         session.commitConfiguration()
+        if locked { device.unlockForConfiguration() }
 
-        configureDevice(device)
+        let maxZ = min(device.activeFormat.videoMaxZoomFactor, CameraModel.zoomLimit)
+        let hasTorch = device.hasTorch
 
         if !session.isRunning {
             session.startRunning()
         }
+
+        DispatchQueue.main.async {
+            self.actualFrameRate = chosenRate
+            self.maxZoom = max(1.0, maxZ)
+            self.torchAvailable = hasTorch
+            if !hasTorch { self.torchOn = false }
+            if self.zoom > self.maxZoom { self.zoom = 1.0 }
+            // A new camera starts at its defaults: re-apply the current adjustments.
+            self.applyZoom()
+            self.applyExposure()
+            self.applyTorch()
+            self.sendInfo()
+        }
     }
 
-    private func configureDevice(_ device: AVCaptureDevice) {
-        do {
-            try device.lockForConfiguration()
-            defer { device.unlockForConfiguration() }
-
-            let supports30 = device.activeFormat.videoSupportedFrameRateRanges.contains {
-                $0.minFrameRate <= 30 && 30 <= $0.maxFrameRate
-            }
-            if supports30 {
-                device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
-                device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
-            }
-            if device.isFocusModeSupported(.continuousAutoFocus) {
-                device.focusMode = .continuousAutoFocus
-            }
-            if device.isExposureModeSupported(.continuousAutoExposure) {
-                device.exposureMode = .continuousAutoExposure
-            }
-            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
-                device.whiteBalanceMode = .continuousAutoWhiteBalance
-            }
-            if device.isLowLightBoostSupported {
-                device.automaticallyEnablesLowLightBoostWhenAvailable = true
-            }
-        } catch {
-            // Keep the camera's defaults.
+    private func applyAutoModes(_ device: AVCaptureDevice) {
+        if device.isFocusModeSupported(.continuousAutoFocus) {
+            device.focusMode = .continuousAutoFocus
+        }
+        if device.isExposureModeSupported(.continuousAutoExposure) {
+            device.exposureMode = .continuousAutoExposure
+        }
+        if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+            device.whiteBalanceMode = .continuousAutoWhiteBalance
+        }
+        if device.isLowLightBoostSupported {
+            device.automaticallyEnablesLowLightBoostWhenAvailable = true
         }
     }
 
@@ -251,13 +365,61 @@ final class CameraModel: NSObject, ObservableObject {
             conn.videoOrientation = currentVideoOrientation
         }
         if conn.isVideoMirroringSupported {
-            // Video apps mirror your self-view themselves; send the true image.
+            // Video apps mirror your self-view themselves, so by default send the true image.
             conn.automaticallyAdjustsVideoMirroring = false
-            conn.isVideoMirrored = false
+            conn.isVideoMirrored = mirrorForSession
         }
         if conn.isVideoStabilizationSupported {
             conn.preferredVideoStabilizationMode = .off // lowest delay
         }
+    }
+
+    // MARK: - Live adjustments
+
+    private func withDevice(_ body: @escaping (AVCaptureDevice) -> Void) {
+        sessionQueue.async {
+            guard let device = self.videoInput?.device else { return }
+            do {
+                try device.lockForConfiguration()
+                body(device)
+                device.unlockForConfiguration()
+            } catch {}
+        }
+    }
+
+    private func applyZoom() {
+        let wanted = zoom
+        withDevice { device in
+            let upper = min(device.maxAvailableVideoZoomFactor, CameraModel.zoomLimit)
+            let lower = device.minAvailableVideoZoomFactor
+            device.videoZoomFactor = min(max(wanted, lower), max(lower, upper))
+        }
+    }
+
+    private func applyExposure() {
+        let wanted = exposureBias
+        withDevice { device in
+            let value = min(max(wanted, device.minExposureTargetBias), device.maxExposureTargetBias)
+            device.setExposureTargetBias(value, completionHandler: nil)
+        }
+    }
+
+    private func applyTorch() {
+        let on = torchOn
+        withDevice { device in
+            guard device.hasTorch, device.isTorchAvailable else { return }
+            if on {
+                try? device.setTorchModeOn(level: 0.5)
+            } else if device.torchMode != .off {
+                device.torchMode = .off
+            }
+        }
+    }
+
+    /// Pinch on the preview. `scale` is relative to the start of the pinch.
+    func pinch(scale: CGFloat, began: Bool) {
+        if began { pinchStartZoom = zoom }
+        zoom = min(max(pinchStartZoom * scale, 1.0), maxZoom)
     }
 
     // MARK: - Orientation
@@ -291,28 +453,19 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
-    private func applyOrientation() {
-        updateOrientationFromDevice()
-    }
-
     // MARK: - Focus
 
     /// `point` is in camera coordinates (0...1).
     func focus(at point: CGPoint) {
-        sessionQueue.async {
-            guard let device = self.videoInput?.device else { return }
-            do {
-                try device.lockForConfiguration()
-                defer { device.unlockForConfiguration() }
-                if device.isFocusPointOfInterestSupported, device.isFocusModeSupported(.continuousAutoFocus) {
-                    device.focusPointOfInterest = point
-                    device.focusMode = .continuousAutoFocus
-                }
-                if device.isExposurePointOfInterestSupported, device.isExposureModeSupported(.continuousAutoExposure) {
-                    device.exposurePointOfInterest = point
-                    device.exposureMode = .continuousAutoExposure
-                }
-            } catch {}
+        withDevice { device in
+            if device.isFocusPointOfInterestSupported, device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusPointOfInterest = point
+                device.focusMode = .continuousAutoFocus
+            }
+            if device.isExposurePointOfInterestSupported, device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposurePointOfInterest = point
+                device.exposureMode = .continuousAutoExposure
+            }
         }
     }
 
@@ -330,20 +483,36 @@ final class CameraModel: NSObject, ObservableObject {
     // MARK: - Info to PC
 
     private func sendInfo() {
-        DispatchQueue.main.async {
-            var info: [String: Any] = [
-                "app": "Akrem Cam",
-                "camera": self.side.rawValue,
-                "lens": self.lens.rawValue,
-                "quality": self.quality.rawValue,
-                "device": UIDevice.current.name,
-            ]
-            if self.lastWidth > 0 {
-                info["width"] = self.lastWidth
-                info["height"] = self.lastHeight
-            }
-            self.server.sendInfo(info)
+        guard started else { return }
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { self.sendInfo() }
+            return
         }
+        var info: [String: Any] = [
+            "app": "Akrem Cam",
+            "device": UIDevice.current.name,
+            "camera": side.rawValue,
+            "lens": lens.rawValue,
+            "lenses": availableLenses.map { $0.rawValue },
+            "quality": quality.rawValue,
+            "fps": frameRate.rawValue,
+            "actualFps": actualFrameRate,
+            "orientation": orientationMode.rawValue,
+            "zoom": Double(zoom),
+            "maxZoom": Double(maxZoom),
+            "exposure": Double(exposureBias),
+            "exposureLimit": Double(CameraModel.exposureLimit),
+            "torch": torchOn,
+            "torchAvailable": torchAvailable,
+            "mirror": mirror,
+            "screenOff": screenOff,
+            "hot": isHot,
+        ]
+        if lastWidth > 0 {
+            info["width"] = lastWidth
+            info["height"] = lastHeight
+        }
+        server.sendInfo(info)
     }
 
     // MARK: - Saving settings
@@ -353,7 +522,9 @@ final class CameraModel: NSObject, ObservableObject {
         d.set(side.rawValue, forKey: "side")
         d.set(lens.rawValue, forKey: "lens")
         d.set(quality.rawValue, forKey: "quality")
+        d.set(frameRate.rawValue, forKey: "fps")
         d.set(orientationMode.rawValue, forKey: "orientation")
+        d.set(mirror, forKey: "mirror")
     }
 
     private func load() {
@@ -361,7 +532,9 @@ final class CameraModel: NSObject, ObservableObject {
         if let v = d.string(forKey: "side"), let s = CameraSide(rawValue: v) { side = s }
         if let v = d.string(forKey: "lens"), let l = Lens(rawValue: v) { lens = l }
         if let v = d.string(forKey: "quality"), let q = VideoQuality(rawValue: v) { quality = q }
+        if let f = FrameRate(rawValue: d.integer(forKey: "fps")) { frameRate = f }
         if let v = d.string(forKey: "orientation"), let o = OrientationMode(rawValue: v) { orientationMode = o }
+        mirror = d.bool(forKey: "mirror")
     }
 }
 
@@ -374,6 +547,12 @@ extension CameraModel: AVCaptureVideoDataOutputSampleBufferDelegate {
         // Nothing to do if the PC isn't connected or is still receiving the last frame.
         guard server.isReadyForFrame,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        // When the phone is very hot, send every other frame to cool it down.
+        if ProcessInfo.processInfo.thermalState == .critical {
+            skipToggle.toggle()
+            if skipToggle { return }
+        }
 
         let w = CVPixelBufferGetWidth(pixelBuffer)
         let h = CVPixelBufferGetHeight(pixelBuffer)
