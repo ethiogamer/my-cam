@@ -52,8 +52,38 @@ jobs:
           name: AkremCam-iPhone
           path: ios/AkremCam.ipa
 
+  android:
+    name: Android app (.apk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Build APK
+        working-directory: android
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk AkremCam.apk
+          ls -la AkremCam.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AkremCam-Android
+          path: AkremCam.apk
+
   windows:
     name: Windows app (.exe)
+    needs: [android]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -93,6 +123,21 @@ jobs:
           cp ext/softcam/Win32/Release/softcam.dll windows/bin/akremcam32.dll
           ls -la windows/bin
 
+      - name: Get the Android app (to install it on phones automatically)
+        uses: actions/download-artifact@v4
+        with:
+          name: AkremCam-Android
+          path: windows/bin
+
+      - name: Get Android USB tool (adb)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://dl.google.com/android/repository/platform-tools-latest-windows.zip -OutFile pt.zip
+          Expand-Archive pt.zip -DestinationPath pt
+          New-Item -ItemType Directory -Force windows/bin/platform-tools | Out-Null
+          foreach ($f in "adb.exe","AdbWinApi.dll","AdbWinUsbApi.dll") { Copy-Item "pt/platform-tools/$f" windows/bin/platform-tools/ }
+          Get-ChildItem windows/bin -Recurse | Select-Object FullName, Length
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -112,6 +157,10 @@ jobs:
           --add-data "icon.ico;."
           --add-binary "bin/akremcam64.dll;."
           --add-binary "bin/akremcam32.dll;."
+          --add-binary "bin/platform-tools/adb.exe;platform-tools"
+          --add-binary "bin/platform-tools/AdbWinApi.dll;platform-tools"
+          --add-binary "bin/platform-tools/AdbWinUsbApi.dll;platform-tools"
+          --add-data "bin/AkremCam.apk;."
           --hidden-import pystray._win32
           akremcam.py
 
@@ -130,7 +179,7 @@ jobs:
 
   release:
     name: Publish downloads
-    needs: [iphone, windows]
+    needs: [iphone, android, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -145,5 +194,5 @@ jobs:
           gh release delete latest --repo "$REPO" --yes --cleanup-tag || true
           gh release create latest --repo "$REPO" \
             --title "Akrem Cam (latest)" \
-            --notes "AkremCam.ipa → install on the iPhone with Sideloadly. AkremCam.exe → run on Windows. Built from ${GITHUB_SHA::7}." \
-            out/AkremCam-iPhone/AkremCam.ipa out/AkremCam-Windows/AkremCam.exe
+            --notes "AkremCam.exe → run on Windows (works with iPhone and Android). AkremCam.apk → Android app (the PC installs it for you). AkremCam.ipa → iPhone app, install with Sideloadly. Built from ${GITHUB_SHA::7}." \
+            out/AkremCam-iPhone/AkremCam.ipa out/AkremCam-Windows/AkremCam.exe out/AkremCam-Android/AkremCam.apk

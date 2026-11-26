@@ -1,6 +1,15 @@
 # Akrem Cam
 
-Use your iPhone as a webcam on Windows — over the **USB cable** (no Wi-Fi, no hotspot).
+Use your **iPhone or Android phone** as a webcam on Windows — over the **USB cable** (no Wi-Fi, no hotspot).
+
+## Android setup (one time)
+
+1. On the phone: Settings → About phone → tap **Build number** 7 times (turns on Developer options).
+2. Settings → Developer options → turn on **USB debugging**.
+3. Plug the phone into the PC and open **AkremCam.exe**. Tap **Allow** on the phone when it asks.
+4. Akrem Cam installs its app on the phone and opens it by itself. (Or install `AkremCam.apk` yourself.)
+
+No 7-day limit on Android — the app stays installed.
 
 ```
 iPhone app  ──USB cable──▶  AkremCam.exe  ──▶  "Akrem Cam" webcam in Zoom / Telegram / OBS / Meet

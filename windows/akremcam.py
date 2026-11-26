@@ -15,6 +15,7 @@ import time
 
 from PIL import Image
 
+import adb
 import processing
 import recorder
 import usbmux
@@ -117,7 +118,7 @@ def recv_exact(sock, n):
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
         if not chunk:
-            raise ConnectionError("iPhone disconnected")
+            raise ConnectionError("phone disconnected")
         buf += chunk
     return bytes(buf)
 
@@ -147,6 +148,7 @@ class PhoneLink(threading.Thread):
         self.info = {}
         self._sock = None
         self._send_lock = threading.Lock()
+        self._last_launch = 0.0
 
     def send_command(self, **command):
         """Sends a setting change to the iPhone, e.g. send_command(zoom=2.0)."""
@@ -191,42 +193,110 @@ class PhoneLink(threading.Thread):
                 time.sleep(1)
 
     def _attempt(self):
+        # 1) iPhone (Apple's USB service, comes with iTunes)
+        iphone_hint = ""
         try:
-            devices = usbmux.list_devices()
+            iphones = [d for d in usbmux.list_devices() if d["usb"]]
         except usbmux.ServiceNotFound:
-            self._set("error", "Apple USB driver not found",
-                      "Install iTunes from apple.com, then open Akrem Cam again.")
-            time.sleep(2)
-            return
-        except (usbmux.UsbmuxError, OSError) as e:
-            self._set("error", "Apple USB service problem", str(e))
-            time.sleep(2)
-            return
-
-        usb_devices = [d for d in devices if d["usb"]]
-        if not usb_devices:
-            self._set("waiting", "Plug in your iPhone with the cable",
-                      "Use a good cable, straight into the PC (no hub).")
-            time.sleep(1)
-            return
-
-        sock, last_error = None, ""
-        for dev in usb_devices:
-            try:
-                sock = usbmux.connect(dev["id"], self.port)
-                break
-            except (usbmux.UsbmuxError, OSError) as e:
-                last_error = str(e)
-        if sock is None:
-            self._set("waiting", "iPhone found — open the Akrem Cam app on it",
-                      "If the iPhone asks \"Trust This Computer?\", tap Trust. (%s)" % last_error)
-            time.sleep(1)
+            iphones, iphone_hint = [], "iPhone: install iTunes from apple.com."
+        except (usbmux.UsbmuxError, OSError):
+            iphones = []
+        if iphones:
+            sock, last_error = None, ""
+            for dev in iphones:
+                try:
+                    sock = usbmux.connect(dev["id"], self.port)
+                    break
+                except (usbmux.UsbmuxError, OSError) as e:
+                    last_error = str(e)
+            if sock is None:
+                self._set("waiting", "iPhone found — open the Akrem Cam app on it",
+                          "If the iPhone asks \"Trust This Computer?\", tap Trust. (%s)" % last_error)
+                time.sleep(1)
+                return
+            self._session(sock, "iPhone")
             return
 
-        self._sock = sock
-        self._set("connected", "Connected to iPhone", "")
+        # 2) Android (USB debugging, through adb)
         try:
+            phones = adb.devices()
+        except adb.AdbError:
+            phones = []
+        ready = [p for p in phones if p["state"] == "device"]
+        if ready:
+            self._android(ready[0])
+            return
+        if any(p["state"] == "unauthorized" for p in phones):
+            self._set("waiting", "Tap \"Allow\" on your Android phone",
+                      "Allow USB debugging from this computer (tick \"Always allow\").")
+            time.sleep(1)
+            return
+        if phones:
+            self._set("waiting", "Android phone is connecting…", "")
+            time.sleep(1)
+            return
+
+        hints = ["Android: turn on USB debugging (Settings → Developer options)."]
+        if iphone_hint:
+            hints.append(iphone_hint)
+        self._set("waiting", "Plug in your phone with the cable", "  ".join(hints))
+        time.sleep(1)
+
+    def _android(self, phone):
+        serial = phone["serial"]
+        name = phone.get("model") or "Android phone"
+        apk = adb.bundled_apk()
+        if apk and not adb.installed(serial):
+            self._set("waiting", "Installing Akrem Cam on %s…" % name,
+                      "If the phone asks to allow the install, tap Allow.")
+            try:
+                adb.install(serial, apk)
+                adb.launch_app(serial)
+            except adb.AdbError as e:
+                self._set("error", "Couldn't install the app on %s" % name,
+                          "Install AkremCam.apk on the phone yourself. (%s)" % str(e)[:120])
+                time.sleep(5)
+                return
+        try:
+            pc_port = adb.forward(serial, self.port)
+        except adb.AdbError as e:
+            self._set("error", "Android connection problem", str(e)[:160])
+            time.sleep(2)
+            return
+        try:
+            sock = socket.create_connection(("127.0.0.1", pc_port), timeout=3)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self._session(sock, name, first_message_timeout=2.5)
+        except NoApp:
+            now = time.monotonic()
+            if now - self._last_launch > 8:
+                self._last_launch = now
+                adb.launch_app(serial)
+            self._set("waiting", "Opening Akrem Cam on %s…" % name,
+                      "Unlock the phone. If it doesn't open, open the Akrem Cam app yourself.")
+            time.sleep(1)
+        except OSError as e:
+            self._set("error", "Android connection problem", str(e)[:160])
+            time.sleep(1)
+        finally:
+            adb.remove_forward(serial, pc_port)
+
+    def _session(self, sock, name, first_message_timeout=None):
+        """Receives from a connected phone until it disconnects."""
+        self._sock = sock
+        try:
+            if first_message_timeout:
+                # adb accepts the connection even when the app isn't running; then it closes at once.
+                sock.settimeout(first_message_timeout)
+                try:
+                    first = read_message(sock)
+                except (socket.timeout, OSError, ConnectionError):
+                    raise NoApp()
+                self._on_message(*first)
+            self._set("connected", "Connected to %s" % name if name != "iPhone" else "Connected to iPhone", "")
             self._receive(sock)
+        except NoApp:
+            raise
         except (OSError, ConnectionError) as e:
             log.info("link closed: %s", e)
         finally:
@@ -236,34 +306,44 @@ class PhoneLink(threading.Thread):
             except OSError:
                 pass
             with self.lock:
+                was_connected = self.state == "connected"
                 self.info = {}
-            if self.running:
-                self._set("waiting", "iPhone disconnected — reconnecting…", "")
+            if self.running and was_connected:
+                self._set("waiting", "Phone disconnected — reconnecting…", "")
                 time.sleep(0.5)
+
+    def _on_message(self, msg_type, payload):
+        if msg_type == MSG_JPEG:
+            self.slot.put(payload)
+        elif msg_type == MSG_INFO:
+            try:
+                info = json.loads(payload.decode("utf-8"))
+                with self.lock:
+                    self.info = info if isinstance(info, dict) else {}
+            except ValueError:
+                pass
 
     def _receive(self, sock):
         sock.settimeout(1.0)
         idle_since = time.monotonic()
+        connected_status = self.status
         while self.running:
             try:
                 msg_type, payload = read_message(sock)
             except socket.timeout:
                 if time.monotonic() - idle_since > 2:
                     self._set("connected", "Connected — waiting for video",
-                              "Keep the Akrem Cam app open on the iPhone screen.")
+                              "Keep the Akrem Cam app open on the phone screen.")
                 continue
+            self._on_message(msg_type, payload)
             if msg_type == MSG_JPEG:
                 idle_since = time.monotonic()
-                self.slot.put(payload)
-                if self.status != "Connected to iPhone":
-                    self._set("connected", "Connected to iPhone", "")
-            elif msg_type == MSG_INFO:
-                try:
-                    info = json.loads(payload.decode("utf-8"))
-                    with self.lock:
-                        self.info = info if isinstance(info, dict) else {}
-                except ValueError:
-                    pass
+                if self.status != connected_status:
+                    self._set("connected", connected_status, "")
+
+
+class NoApp(Exception):
+    """The phone is connected but the Akrem Cam app isn't answering."""
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +480,9 @@ class CameraPump(threading.Thread):
             elif new_seq != seq and jpeg:
                 seq = new_seq
                 try:
+                    phone_rot = int(self.link.info.get("frameRotation", 0) or 0)
+                    if phone_rot:
+                        framing = dict(framing, rotate=(int(framing.get("rotate", 0)) + phone_rot) % 360)
                     out = processing.process(jpeg, w, h, framing, lut)
                     last_frame = now
                     count += 1

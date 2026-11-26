@@ -500,10 +500,10 @@ class App:
     # ---- left sidebar: the iPhone camera -------------------------------------
 
     def _build_left(self, p):
-        self._section_title(p, "iPhone camera")
+        self._section_title(p, "Phone camera")
 
         dev = self._card(p, "Device")
-        self.device_name = tk.Label(dev, text="No iPhone connected", font=(FONT, 11, "bold"),
+        self.device_name = tk.Label(dev, text="No phone connected", font=(FONT, 11, "bold"),
                                     bg=C["card"], fg=C["fg"], anchor="w")
         self.device_name.pack(fill="x")
         self.device_sub = tk.Label(dev, text="Plug in the cable and open the app", font=(FONT, 9),
@@ -575,7 +575,7 @@ class App:
 
         light = self._card(p, "Light")
         self.torch_var = tk.BooleanVar(value=False)
-        self.torch_sw = self._phone(Switch(light, "iPhone flash light", self.torch_var,
+        self.torch_sw = self._phone(Switch(light, "Phone flash light", self.torch_var,
                                            lambda v: self.send("torch", torch=v)))
         self.torch_sw.pack(fill="x", pady=(0, 6))
         self.torch_level = self._phone(Slider(light, "Light strength", 0.05, 1.0, 0.5,
@@ -584,7 +584,7 @@ class App:
                                                                   torchLevel=round(v, 2))))
         self.torch_level.pack(fill="x")
 
-        opt = self._card(p, "Video from iPhone")
+        opt = self._card(p, "Video from phone")
         tk.Label(opt, text="Quality", font=(FONT, 9), bg=C["card"], fg=C["dim"], anchor="w").pack(fill="x")
         self.quality_var = tk.StringVar(value="1080p")
         self._phone(Segmented(opt, [("720p", "720p"), ("1080p", "1080p")], self.quality_var,
@@ -609,7 +609,7 @@ class App:
         self.hdr_sw = self._phone(Switch(opt, "HDR video", self.hdr_var, lambda v: self.send("hdr", hdr=v)))
         self.hdr_sw.pack(fill="x", pady=2)
         self.dark_var = tk.BooleanVar(value=False)
-        self._phone(Switch(opt, "Dark iPhone screen (saves battery)", self.dark_var,
+        self._phone(Switch(opt, "Dark phone screen (saves battery)", self.dark_var,
                            lambda v: self.send("screenOff", screenOff=v))).pack(fill="x", pady=2)
         self._gap(opt)
         self._phone(flat_button(opt, "Reset camera to automatic", self.reset_camera)).pack(anchor="w")
@@ -994,7 +994,7 @@ class App:
             self.device_sub.configure(text="  ·  ".join(parts))
             self._sync(info)
         else:
-            self.device_name.configure(text="No iPhone connected")
+            self.device_name.configure(text="No phone connected")
             self.device_sub.configure(text=detail or status)
         for w in self.phone_controls:
             self._enable(w, self.connected)
@@ -1002,7 +1002,7 @@ class App:
 
         warnings = []
         if info.get("hot"):
-            warnings.append("iPhone is hot — take it out of its case or choose 30 fps.")
+            warnings.append("Phone is hot — take it out of its case or choose 30 fps.")
         if info.get("fps") and info.get("actualFps") and info["actualFps"] < info["fps"]:
             warnings.append("This lens can't do %s fps; using %s." % (info["fps"], info["actualFps"]))
         if self.pump.record_error:
@@ -1048,7 +1048,8 @@ class App:
         for widget, key in ((self.exp_seg, "manualExposureSupported"), (self.focus_seg, "manualFocusSupported"),
                             (self.wb_seg, "manualWhiteBalanceSupported"), (self.torch_sw, "torchAvailable"),
                             (self.torch_level, "torchAvailable"), (self.stab_sw, "stabilizationSupported"),
-                            (self.hdr_sw, "hdrSupported")):
+                            (self.hdr_sw, "hdrSupported"), (self.torch_level, "torchLevelSupported"),
+                            (self.tint, "tintSupported")):
             if key in info and not info[key]:
                 widget.set_enabled(False)
         if info.get("exposureManual"):
@@ -1059,7 +1060,8 @@ class App:
         if lenses != self.lens_names:
             self.lens_names = lenses
             self.lens_seg.set_options([(n, n) for n in lenses])
-        self.zoom.set_range(1.0, max(1.1, float(info.get("maxZoom") or 1.0)))
+        low = float(info.get("minZoom") or 1.0)
+        self.zoom.set_range(low, max(low + 0.1, float(info.get("maxZoom") or 1.0)))
         if info.get("isoMin") and info.get("isoMax"):
             self.iso.set_range(float(info["isoMin"]), float(info["isoMax"]))
         modes_before = (self.exp_mode.get(), self.focus_mode.get(), self.wb_mode.get())
