@@ -1,12 +1,13 @@
-"""Akrem Cam for Windows — turns your iPhone (over the USB cable) into a webcam.
+"""CamBridge for Windows — turns your iPhone (over the USB cable) into a webcam.
 
-iPhone app  --USB cable (Apple usbmuxd)-->  this program  -->  "Akrem Cam" virtual webcam
+iPhone app  --USB cable (Apple usbmuxd)-->  this program  -->  "CamBridge" virtual webcam
 """
 
 import io
 import json
 import logging
 import os
+import queue
 import socket
 import struct
 import sys
@@ -20,17 +21,18 @@ import processing
 import recorder
 import usbmux
 import virtualcam
+import wifi
 
-APP_NAME = "Akrem Cam"
+APP_NAME = "CamBridge"
 VERSION = "1.0"
 PHONE_PORT = 7878
-MAGIC = b"AKC1"
+MAGIC = b"CBG1"
 MSG_JPEG = 1
 MSG_INFO = 2
 MSG_COMMAND = 3
 OUTPUT_SIZES = {"1080p": (1920, 1080), "720p": (1280, 720)}
 
-log = logging.getLogger("akremcam")
+log = logging.getLogger("cambridge")
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +51,9 @@ class Settings:
         "tray_tip_shown": False,
         "left_open": True,
         "right_open": True,
+        "pc_id": "",
+        "pair_key": "",
+        "trusted": {},
     }
 
     def __init__(self):
@@ -149,6 +154,15 @@ class PhoneLink(threading.Thread):
         self._sock = None
         self._send_lock = threading.Lock()
         self._last_launch = 0.0
+        self._wifi = queue.Queue()
+        self.transport = ""
+
+    def offer_wifi(self, sock, name):
+        """A phone on Wi-Fi was accepted; use it on the next loop."""
+        self._wifi.put((sock, name))
+
+    def is_busy(self):
+        return self._sock is not None
 
     def send_command(self, **command):
         """Sends a setting change to the iPhone, e.g. send_command(zoom=2.0)."""
@@ -193,6 +207,16 @@ class PhoneLink(threading.Thread):
                 time.sleep(1)
 
     def _attempt(self):
+        # 0) A phone that just connected over Wi-Fi
+        try:
+            sock, name = self._wifi.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self.transport = "wifi"
+            self._session(sock, "%s over Wi-Fi" % name, first_message_timeout=5)
+            return
+
         # 1) iPhone (Apple's USB service, comes with iTunes)
         iphone_hint = ""
         try:
@@ -210,10 +234,11 @@ class PhoneLink(threading.Thread):
                 except (usbmux.UsbmuxError, OSError) as e:
                     last_error = str(e)
             if sock is None:
-                self._set("waiting", "iPhone found — open the Akrem Cam app on it",
+                self._set("waiting", "iPhone found — open the CamBridge app on it",
                           "If the iPhone asks \"Trust This Computer?\", tap Trust. (%s)" % last_error)
                 time.sleep(1)
                 return
+            self.transport = "usb"
             self._session(sock, "iPhone")
             return
 
@@ -247,14 +272,14 @@ class PhoneLink(threading.Thread):
         name = phone.get("model") or "Android phone"
         apk = adb.bundled_apk()
         if apk and not adb.installed(serial):
-            self._set("waiting", "Installing Akrem Cam on %s…" % name,
+            self._set("waiting", "Installing CamBridge on %s…" % name,
                       "If the phone asks to allow the install, tap Allow.")
             try:
                 adb.install(serial, apk)
                 adb.launch_app(serial)
             except adb.AdbError as e:
                 self._set("error", "Couldn't install the app on %s" % name,
-                          "Install AkremCam.apk on the phone yourself. (%s)" % str(e)[:120])
+                          "Install CamBridge.apk on the phone yourself. (%s)" % str(e)[:120])
                 time.sleep(5)
                 return
         try:
@@ -266,14 +291,15 @@ class PhoneLink(threading.Thread):
         try:
             sock = socket.create_connection(("127.0.0.1", pc_port), timeout=3)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.transport = "usb"
             self._session(sock, name, first_message_timeout=2.5)
         except NoApp:
             now = time.monotonic()
             if now - self._last_launch > 8:
                 self._last_launch = now
                 adb.launch_app(serial)
-            self._set("waiting", "Opening Akrem Cam on %s…" % name,
-                      "Unlock the phone. If it doesn't open, open the Akrem Cam app yourself.")
+            self._set("waiting", "Opening CamBridge on %s…" % name,
+                      "Unlock the phone. If it doesn't open, open the CamBridge app yourself.")
             time.sleep(1)
         except OSError as e:
             self._set("error", "Android connection problem", str(e)[:160])
@@ -296,6 +322,9 @@ class PhoneLink(threading.Thread):
             self._set("connected", "Connected to %s" % name if name != "iPhone" else "Connected to iPhone", "")
             self._receive(sock)
         except NoApp:
+            if "Wi-Fi" in name:
+                log.info("Wi-Fi phone sent nothing; closed")
+                return
             raise
         except (OSError, ConnectionError) as e:
             log.info("link closed: %s", e)
@@ -333,7 +362,7 @@ class PhoneLink(threading.Thread):
             except socket.timeout:
                 if time.monotonic() - idle_since > 2:
                     self._set("connected", "Connected — waiting for video",
-                              "Keep the Akrem Cam app open on the phone screen.")
+                              "Keep the CamBridge app open on the phone screen.")
                 continue
             self._on_message(msg_type, payload)
             if msg_type == MSG_JPEG:
@@ -343,7 +372,7 @@ class PhoneLink(threading.Thread):
 
 
 class NoApp(Exception):
-    """The phone is connected but the Akrem Cam app isn't answering."""
+    """The phone is connected but the CamBridge app isn't answering."""
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +521,7 @@ class CameraPump(threading.Thread):
                 _, status, _, _ = self.link.snapshot()
                 key = (w, h, status)
                 if key != filler_key:
-                    filler = processing.make_placeholder(w, h, "Akrem Cam", status)
+                    filler = processing.make_placeholder(w, h, "CamBridge", status)
                     filler_key = key
                 out = filler
                 last_filler = now
@@ -544,25 +573,25 @@ def autostart_enabled():
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-            winreg.QueryValueEx(key, "AkremCam")
+            winreg.QueryValueEx(key, "CamBridge")
         return True
     except OSError:
         return False
 
 
 def set_autostart(enabled):
-    """Adds/removes AkremCam from programs that start with Windows (minimised)."""
+    """Adds/removes CamBridge from programs that start with Windows (minimised)."""
     if sys.platform != "win32" or not getattr(sys, "frozen", False):
         return False
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
             if enabled:
-                winreg.SetValueEx(key, "AkremCam", 0, winreg.REG_SZ,
+                winreg.SetValueEx(key, "CamBridge", 0, winreg.REG_SZ,
                                   '"%s" --minimized' % sys.executable)
             else:
                 try:
-                    winreg.DeleteValue(key, "AkremCam")
+                    winreg.DeleteValue(key, "CamBridge")
                 except OSError:
                     pass
         return True
@@ -571,7 +600,7 @@ def set_autostart(enabled):
 
 
 def install_camera(force=False):
-    """Makes sure the 'Akrem Cam' webcam is installed in Windows. Returns True if OK."""
+    """Makes sure the 'CamBridge' webcam is installed in Windows. Returns True if OK."""
     try:
         virtualcam.copy_dlls()
     except OSError as e:
@@ -596,10 +625,16 @@ def self_test():
     lut = processing.build_lut(processing.FILTERS["Mono"])
     framed = processing.process(jpeg, 1920, 1080, dict(processing.DEFAULT_FRAMING, rotate=90, zoom=2.0), lut)
     assert framed.size == (1920, 1080) and framed.getpixel((0, 0)) == (0, 0, 0)
-    processing.make_placeholder(1920, 1080, "Akrem Cam", "self test")
+    processing.make_placeholder(1920, 1080, "CamBridge", "self test")
     processing.make_pause_screen(framed, 1280, 720)
     import ui  # make sure the window code at least loads
     assert ui.App
+    import wifi
+    url = wifi.pairing_url({"pair_key": "k", "pc_id": "id"})
+    assert url.startswith("cambridge://pair?")
+    wifi.qr_image(url, 200)
+    from zeroconf import Zeroconf  # discovery library is bundled
+    assert Zeroconf
     if sys.platform == "win32":
         cam = virtualcam.VirtualCamera(1280, 720)
         for _ in range(10):
@@ -635,7 +670,7 @@ def main():
     root.withdraw()
 
     if sys.platform == "win32" and not virtualcam.is_registered():
-        messagebox.showinfo(APP_NAME, "Akrem Cam will now install its webcam (one time only).\n\n"
+        messagebox.showinfo(APP_NAME, "CamBridge will now install its webcam (one time only).\n\n"
                                       "Windows will ask for permission — click \"Yes\".")
         if not install_camera():
             messagebox.showwarning(APP_NAME, "The webcam was not installed, so apps won't see it yet.\n"
@@ -654,12 +689,17 @@ def main():
     pump.start()
     time.sleep(0.2)
     if pump.error and "already running" in pump.error:
-        messagebox.showinfo(APP_NAME, "Akrem Cam is already open — look for its icon next to the clock.")
+        messagebox.showinfo(APP_NAME, "CamBridge is already open — look for its icon next to the clock.")
         return
     link.start()
+    wifi.ensure_identity(settings)
+    wifi_server = wifi.WifiServer(settings, link)
+    wifi_server.start()
 
-    ui.App(root, settings, slot, link, pump, core=sys.modules[__name__], start_minimized="--minimized" in args)
+    ui.App(root, settings, slot, link, pump, core=sys.modules[__name__], wifi=wifi_server,
+           start_minimized="--minimized" in args)
     root.mainloop()
+    wifi_server.stop()
     log.info("closed")
 
 

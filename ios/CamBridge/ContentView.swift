@@ -3,8 +3,10 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject var model: CameraModel
+    @EnvironmentObject var wifi: WifiManager
     @State private var showPanel = false
     @State private var panelTab = 0
+    @State private var showWifi = false
 
     var body: some View {
         ZStack {
@@ -25,11 +27,15 @@ struct ContentView: View {
                         ControlPanel(tab: $panelTab)
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
-                    Toolbar(showPanel: $showPanel)
+                    Toolbar(showPanel: $showPanel, showWifi: $showWifi)
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .animation(.easeOut(duration: 0.2), value: showPanel)
+            }
+
+            if model.scanning {
+                ScanOverlay()
             }
 
             if model.screenOff {
@@ -37,6 +43,11 @@ struct ContentView: View {
             }
         }
         .statusBarHidden(true)
+        .sheet(isPresented: $showWifi) {
+            WifiSheet()
+                .environmentObject(model)
+                .environmentObject(wifi)
+        }
     }
 }
 
@@ -44,6 +55,7 @@ struct ContentView: View {
 
 private struct StatusBar: View {
     @EnvironmentObject var model: CameraModel
+    @EnvironmentObject var wifi: WifiManager
 
     var body: some View {
         VStack(spacing: 8) {
@@ -52,11 +64,12 @@ private struct StatusBar: View {
                     .fill(model.isConnected ? Color.green : Color.orange)
                     .frame(width: 12, height: 12)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(model.isConnected ? "Connected to PC" : "Waiting for PC")
+                    Text(model.isConnected ? (wifi.connectedPC.map { "Connected to \($0)" } ?? "Connected to PC")
+                                           : "Waiting for PC")
                         .font(.headline)
                     Text(model.isConnected
-                         ? "\(model.fps) fps • \(model.quality.rawValue)"
-                         : "Plug in the cable and open Akrem Cam on the PC")
+                         ? "\(model.fps) fps • \(model.quality.rawValue) • \(wifi.connectedPC == nil ? "USB" : "Wi-Fi")"
+                         : (wifi.status.isEmpty ? "Plug in the cable, or tap Wi-Fi below" : wifi.status))
                         .font(.caption)
                         .foregroundColor(.white.opacity(0.75))
                 }
@@ -107,6 +120,7 @@ private struct RoundButton: View {
 private struct Toolbar: View {
     @EnvironmentObject var model: CameraModel
     @Binding var showPanel: Bool
+    @Binding var showWifi: Bool
 
     var body: some View {
         HStack(spacing: 10) {
@@ -130,6 +144,9 @@ private struct Toolbar: View {
                 }
             }
             Spacer(minLength: 0)
+            RoundButton(system: "wifi", active: false, label: "Wi-Fi") {
+                showWifi = true
+            }
             RoundButton(system: showPanel ? "chevron.down" : "slider.horizontal.3", active: showPanel,
                         label: "Camera settings") {
                 showPanel.toggle()
@@ -323,6 +340,107 @@ private struct SliderRow: View {
     }
 }
 
+// MARK: - Wi-Fi
+
+private struct WifiSheet: View {
+    @EnvironmentObject var model: CameraModel
+    @EnvironmentObject var wifi: WifiManager
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationView {
+            List {
+                Section(header: Text("Status")) {
+                    Text(wifi.status.isEmpty ? (model.isConnected ? "Connected by USB cable" : "Not connected") : wifi.status)
+                    if wifi.connectedPC != nil {
+                        Button("Disconnect", role: .destructive) { wifi.disconnect() }
+                    }
+                }
+                Section(header: Text("PCs on this Wi-Fi"),
+                        footer: Text("Open CamBridge on the PC. The phone and PC must be on the same Wi-Fi.")) {
+                    if wifi.found.isEmpty {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text("Looking for PCs…").foregroundColor(.secondary)
+                        }
+                    }
+                    ForEach(wifi.found) { pc in
+                        Button {
+                            wifi.connect(pc)
+                            dismiss()
+                        } label: {
+                            HStack {
+                                Image(systemName: "desktopcomputer")
+                                Text(pc.name)
+                                Spacer()
+                                if wifi.connectedPC == pc.name {
+                                    Text("Connected").foregroundColor(.green)
+                                } else if wifi.saved[pc.id] != nil {
+                                    Text("Paired").foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+                Section(footer: Text("On the PC, click “Wi-Fi” to show the code. A USB cable is still the most stable.")) {
+                    Button {
+                        dismiss()
+                        model.scanning = true
+                    } label: {
+                        Label("Scan QR code on the PC", systemImage: "qrcode.viewfinder")
+                    }
+                }
+                if !wifi.saved.isEmpty {
+                    Section(header: Text("Remembered PCs")) {
+                        ForEach(Array(wifi.saved.values), id: \.id) { pc in
+                            HStack {
+                                Text(pc.name)
+                                Spacer()
+                                Button("Forget") { wifi.forget(pc.id) }
+                                    .foregroundColor(.red)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Wi-Fi")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+private struct ScanOverlay: View {
+    @EnvironmentObject var model: CameraModel
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Spacer()
+            RoundedRectangle(cornerRadius: 22)
+                .stroke(Color.yellow, lineWidth: 4)
+                .frame(width: 240, height: 240)
+            Text("Point at the QR code on your PC")
+                .font(.headline)
+                .foregroundColor(.white)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(Capsule().fill(Color.black.opacity(0.6)))
+            Spacer()
+            Button("Cancel") { model.scanning = false }
+                .font(.headline)
+                .padding(.horizontal, 30)
+                .padding(.vertical, 12)
+                .background(Capsule().fill(Color.black.opacity(0.7)))
+                .foregroundColor(.white)
+                .padding(.bottom, 40)
+        }
+    }
+}
+
 // MARK: - Screen off
 
 private struct ScreenOffView: View {
@@ -352,7 +470,7 @@ private struct PermissionView: View {
                 .font(.system(size: 44))
             Text("Camera access is off")
                 .font(.title2.bold())
-            Text("Akrem Cam needs the camera to work as your PC webcam.")
+            Text("CamBridge needs the camera to work as your PC webcam.")
                 .multilineTextAlignment(.center)
                 .foregroundColor(.white.opacity(0.75))
             Button("Open Settings") {

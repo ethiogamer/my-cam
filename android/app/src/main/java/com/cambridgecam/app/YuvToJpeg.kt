@@ -1,4 +1,4 @@
-package com.akrem.cam
+package com.cambridgecam.app
 
 import android.graphics.ImageFormat
 import android.graphics.Rect

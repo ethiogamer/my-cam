@@ -52,7 +52,7 @@ def _recv_exact(sock, n):
 
 
 def _request(sock, payload, tag):
-    base = {"ClientVersionString": "akremcam", "ProgName": "AkremCam"}
+    base = {"ClientVersionString": "cambridge", "ProgName": "CamBridge"}
     base.update(payload)
     body = plistlib.dumps(base, fmt=plistlib.FMT_XML)
     header = struct.pack("<IIII", 16 + len(body), _PLIST_VERSION, _MSG_PLIST, tag)
@@ -87,9 +87,9 @@ def list_devices(timeout=3.0):
 
 
 _CONNECT_ERRORS = {
-    1: "device refused the connection (is the Akrem Cam app open on the iPhone?)",
+    1: "device refused the connection (is the CamBridge app open on the iPhone?)",
     2: "device is not connected",
-    3: "connection refused (is the Akrem Cam app open on the iPhone?)",
+    3: "connection refused (is the CamBridge app open on the iPhone?)",
     6: "bad request",
 }
 

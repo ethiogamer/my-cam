@@ -5,7 +5,7 @@ import Network
 /// using Apple's USB channel (usbmuxd) — no Wi-Fi, no hotspot.
 ///
 /// Wire format (phone -> PC), every message:
-///   4 bytes  magic "AKC1"
+///   4 bytes  magic "CBG1"
 ///   4 bytes  type   (UInt32, big-endian)  1 = JPEG frame, 2 = JSON info, 3 = JSON command (PC -> phone)
 ///   4 bytes  length (UInt32, big-endian)
 ///   N bytes  payload
@@ -16,6 +16,8 @@ final class StreamServer {
         case jpeg = 1
         case info = 2
         case command = 3
+        case hello = 5
+        case welcome = 6
     }
 
     /// Called (on any thread) when the PC connects or disconnects.
@@ -25,9 +27,16 @@ final class StreamServer {
     /// Called (on any thread) when the PC sends a command, e.g. ["zoom": 2.0].
     var onCommand: (([String: Any]) -> Void)?
 
-    private var inbox = Data()
+    /// Wi-Fi: the PC answered our hello ("waiting", "ok", "denied", "busy").
+    var onWelcome: ((String, [String: Any]) -> Void)?
+    /// Wi-Fi: our outgoing connection closed. Bool = it had been accepted.
+    var onOutgoingClosed: ((Bool) -> Void)?
 
-    private let queue = DispatchQueue(label: "akremcam.server")
+    private var inbox = Data()
+    private var outgoing = false
+    private var outgoingAccepted = false
+
+    private let queue = DispatchQueue(label: "cambridge.server")
     private var listener: NWListener?
     private var connection: NWConnection?
 
@@ -98,8 +107,58 @@ final class StreamServer {
         }
     }
 
+    /// Wi-Fi: connect out to the PC and say hello. Frames start once the PC answers "ok".
+    func connectOut(to endpoint: NWEndpoint, hello: [String: Any]) {
+        queue.async {
+            self.dropConnection()
+            let tcp = NWProtocolTCP.Options()
+            tcp.noDelay = true
+            tcp.connectionTimeout = 6
+            let conn = NWConnection(to: endpoint, using: NWParameters(tls: nil, tcp: tcp))
+            self.connection = conn
+            self.inbox = Data()
+            self.outgoing = true
+            self.outgoingAccepted = false
+            conn.stateUpdateHandler = { [weak self, weak conn] state in
+                guard let self = self, let conn = conn else { return }
+                switch state {
+                case .ready:
+                    if let data = try? JSONSerialization.data(withJSONObject: hello) {
+                        self.sendRaw(conn, type: .hello, payload: data)
+                    }
+                    self.receiveLoop(conn)
+                case .waiting:
+                    conn.cancel()  // can't reach this address
+                case .failed, .cancelled:
+                    self.queue.async {
+                        if self.connection === conn { self.dropConnection() }
+                    }
+                default:
+                    break
+                }
+            }
+            conn.start(queue: self.queue)
+        }
+    }
+
+    /// Wi-Fi: hang up on purpose.
+    func disconnectOut() {
+        queue.async {
+            if self.outgoing { self.dropConnection() }
+        }
+    }
+
+    private func sendRaw(_ conn: NWConnection, type: MessageType, payload: Data) {
+        var message = Data(capacity: 12 + payload.count)
+        message.append(contentsOf: Array("CBG1".utf8))
+        message.append(StreamServer.bigEndianBytes(type.rawValue))
+        message.append(StreamServer.bigEndianBytes(UInt32(payload.count)))
+        message.append(payload)
+        conn.send(content: message, completion: .contentProcessed { _ in })
+    }
+
     private func accept(_ conn: NWConnection) {
-        // Only one PC at a time: the newest connection wins.
+        // Only one PC at a time: the newest connection wins (a USB cable beats Wi-Fi).
         dropConnection()
         connection = conn
         inbox = Data()
@@ -144,26 +203,39 @@ final class StreamServer {
     private func parseInbox() -> Bool {
         while inbox.count >= 12 {
             let header = [UInt8](inbox.prefix(12))
-            guard header[0] == 0x41, header[1] == 0x4B, header[2] == 0x43, header[3] == 0x31 else { return false }
+            guard header[0] == 0x43, header[1] == 0x42, header[2] == 0x47, header[3] == 0x31 else { return false }
             let type = UInt32(header[4]) << 24 | UInt32(header[5]) << 16 | UInt32(header[6]) << 8 | UInt32(header[7])
             let length = Int(UInt32(header[8]) << 24 | UInt32(header[9]) << 16 | UInt32(header[10]) << 8 | UInt32(header[11]))
             guard length <= 1_000_000 else { return false }
             guard inbox.count >= 12 + length else { break }
             let payload = Data(inbox.dropFirst(12).prefix(length))
             inbox = Data(inbox.dropFirst(12 + length))
-            if type == MessageType.command.rawValue,
-               let object = try? JSONSerialization.jsonObject(with: payload),
-               let dict = object as? [String: Any] {
+            guard let object = try? JSONSerialization.jsonObject(with: payload),
+                  let dict = object as? [String: Any] else { continue }
+            if type == MessageType.command.rawValue {
                 onCommand?(dict)
+            } else if type == MessageType.welcome.rawValue, outgoing {
+                let status = dict["status"] as? String ?? ""
+                if status == "ok" {
+                    outgoingAccepted = true
+                    setConnected(true)
+                    onNewConnection?()
+                }
+                onWelcome?(status, dict)
+                if status == "denied" || status == "busy" { return false }
             }
         }
         return true
     }
 
     private func dropConnection() {
+        let wasOutgoing = outgoing, wasAccepted = outgoingAccepted
+        outgoing = false
+        outgoingAccepted = false
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
+        if wasOutgoing { onOutgoingClosed?(wasAccepted) }
         lock.lock()
         _sending = false
         lock.unlock()
@@ -204,7 +276,7 @@ final class StreamServer {
             }
 
             var message = Data(capacity: 12 + payload.count)
-            message.append(contentsOf: Array("AKC1".utf8))
+            message.append(contentsOf: Array("CBG1".utf8))
             message.append(StreamServer.bigEndianBytes(type.rawValue))
             message.append(StreamServer.bigEndianBytes(UInt32(payload.count)))
             message.append(payload)

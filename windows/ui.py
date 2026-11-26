@@ -1,6 +1,6 @@
-"""The Akrem Cam window (Camo-style layout).
+"""The CamBridge window (Camo-style layout).
 
- ┌ top bar:  ☰  Akrem Cam  ● status            profile ▾   ⏸ Pause   ● Record   ☰ ┐
+ ┌ top bar:  ☰  CamBridge  ● status            profile ▾   ⏸ Pause   ● Record   ☰ ┐
  │ left sidebar        │            live preview              │ right sidebar      │
  │ (iPhone camera:     │   drag = move, scroll = zoom,         │ (picture: filters, │
  │  lens, exposure,    │   double-click = reset framing        │  adjust, framing,  │
@@ -183,7 +183,7 @@ class Slider(tk.Frame):
         self.value_label = tk.Label(top, font=(FONT, 9, "bold"), bg=bg, fg=C["fg"], anchor="e")
         self.value_label.pack(side="right")
         self.scale = ttk.Scale(self, variable=self.var, from_=lo, to=hi, orient="horizontal",
-                               command=self._moved, style="Akrem.Horizontal.TScale")
+                               command=self._moved, style="CamBridge.Horizontal.TScale")
         self.scale.pack(fill="x", pady=(1, 0))
         self.var.trace_add("write", lambda *_: self.show())
         self.show()
@@ -244,13 +244,13 @@ def start_tray(app, icon_path):
         return lambda icon, item: app.ui_queue.put(name)
 
     menu = pystray.Menu(
-        pystray.MenuItem("Open Akrem Cam", act("show"), default=True),
+        pystray.MenuItem("Open CamBridge", act("show"), default=True),
         pystray.MenuItem(lambda item: "Resume camera" if app.pump.paused else "Pause camera", act("pause")),
         pystray.MenuItem(lambda item: "Stop recording" if app.pump.recorder else "Start recording", act("record")),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quit Akrem Cam", act("quit")),
+        pystray.MenuItem("Quit CamBridge", act("quit")),
     )
-    icon = pystray.Icon("AkremCam", image, "Akrem Cam", menu)
+    icon = pystray.Icon("CamBridge", image, "CamBridge", menu)
     threading.Thread(target=icon.run, daemon=True).start()
     return icon
 
@@ -260,13 +260,16 @@ def start_tray(app, icon_path):
 # ---------------------------------------------------------------------------
 
 class App:
-    def __init__(self, root, settings, slot, link, pump, core=None, start_minimized=False):
+    def __init__(self, root, settings, slot, link, pump, core=None, wifi=None, start_minimized=False):
         self.root = root
         self.settings = settings
         self.slot = slot
         self.link = link
         self.pump = pump
         self.core = core or sys.modules.get("__main__")
+        self.wifi = wifi
+        self.wifi_window = None
+        self.qr_photo = None
         self.ui_queue = queue.Queue()
         self.touched = {}
         self.pending = {}
@@ -280,7 +283,7 @@ class App:
         self.drag_from = None
         self.quitting = False
 
-        root.title("Akrem Cam")
+        root.title("CamBridge")
         root.configure(bg=C["bg"])
         root.geometry("1320x800")
         root.minsize(1000, 620)
@@ -329,14 +332,14 @@ class App:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("Akrem.Horizontal.TScale", background=C["accent"], troughcolor=C["line"],
+        style.configure("CamBridge.Horizontal.TScale", background=C["accent"], troughcolor=C["line"],
                         bordercolor=C["card"], lightcolor=C["accent"], darkcolor=C["accent"],
                         sliderlength=14, sliderthickness=14)
-        style.map("Akrem.Horizontal.TScale", background=[("disabled", C["faint"])])
-        style.configure("Akrem.TCombobox", fieldbackground=C["button"], background=C["button"],
+        style.map("CamBridge.Horizontal.TScale", background=[("disabled", C["faint"])])
+        style.configure("CamBridge.TCombobox", fieldbackground=C["button"], background=C["button"],
                         foreground=C["fg"], arrowcolor=C["fg"], bordercolor=C["line"],
                         lightcolor=C["button"], darkcolor=C["button"], padding=4)
-        style.map("Akrem.TCombobox", fieldbackground=[("readonly", C["button"])],
+        style.map("CamBridge.TCombobox", fieldbackground=[("readonly", C["button"])],
                   foreground=[("readonly", C["fg"]), ("disabled", C["faint"])],
                   selectbackground=[("readonly", C["button"])], selectforeground=[("readonly", C["fg"])])
         self.root.option_add("*TCombobox*Listbox.background", C["card"])
@@ -380,7 +383,7 @@ class App:
         logo.create_oval(2, 2, 20, 20, fill="#1f6fe0", outline="")
         logo.create_oval(7, 7, 15, 15, fill="#ffffff", outline="")
         logo.pack(side="left", padx=(4, 6))
-        tk.Label(bar, text="Akrem Cam", font=(FONT, 13, "bold"), bg=C["bar"], fg=C["fg"]).pack(side="left")
+        tk.Label(bar, text="CamBridge", font=(FONT, 13, "bold"), bg=C["bar"], fg=C["fg"]).pack(side="left")
 
         pill = tk.Frame(bar, bg=C["button"], padx=10, pady=4)
         pill.pack(side="left", padx=16)
@@ -398,9 +401,11 @@ class App:
         self.pause_btn = flat_button(bar, "❚❚  Pause", self.toggle_pause, bold=True, padx=14, pady=6)
         self.pause_btn.pack(side="right", padx=4)
 
+        flat_button(bar, "((·))  Wi-Fi", self.open_wifi, bold=True, padx=14, pady=6).pack(side="right", padx=4)
+
         self.profile_var = tk.StringVar(value="Profile")
         prof = ttk.Combobox(bar, textvariable=self.profile_var, values=list(PROFILES), state="readonly",
-                            width=22, style="Akrem.TCombobox")
+                            width=22, style="CamBridge.TCombobox")
         prof.pack(side="right", padx=10)
         prof.bind("<<ComboboxSelected>>", lambda e: self.apply_profile(self.profile_var.get()))
 
@@ -410,7 +415,7 @@ class App:
         bar = tk.Frame(self.root, bg=C["bar"], height=30)
         bar.pack(fill="x", side="bottom")
         bar.pack_propagate(False)
-        tk.Label(bar, text="In Zoom, Telegram, OBS or Meet, choose the camera “Akrem Cam”.",
+        tk.Label(bar, text="In Zoom, Telegram, OBS or Meet, choose the camera “CamBridge”.",
                  font=(FONT, 9), bg=C["bar"], fg=C["dim"]).pack(side="left", padx=12)
         self.toast = tk.Label(bar, text="", font=(FONT, 9, "bold"), bg=C["bar"], fg=C["accent"], cursor="hand2")
         self.toast.pack(side="left", padx=12)
@@ -597,7 +602,7 @@ class App:
                  anchor="w").pack(fill="x")
         self.orient_var = tk.StringVar(value="Auto")
         orient = self._phone(ttk.Combobox(opt, textvariable=self.orient_var, state="readonly",
-                                          style="Akrem.TCombobox",
+                                          style="CamBridge.TCombobox",
                                           values=["Auto", "Landscape", "Landscape (flipped)", "Portrait"]))
         orient.pack(fill="x", pady=(2, 8))
         orient.bind("<<ComboboxSelected>>", lambda e: self.send("orientation", orientation=self.orient_var.get()))
@@ -878,7 +883,7 @@ class App:
         fn = getattr(self.core, "set_autostart", None)
         if not fn or not fn(enabled):
             self.autostart_var.set(self._core("autostart_enabled", False))
-            self.show_toast("“Start with Windows” works in the installed AkremCam.exe")
+            self.show_toast("“Start with Windows” works in the installed CamBridge.exe")
 
     def set_close_to_tray(self, enabled):
         self.settings["close_to_tray"] = bool(enabled)
@@ -897,9 +902,9 @@ class App:
     def repair(self):
         fn = getattr(self.core, "install_camera", None)
         if fn and fn(force=True):
-            messagebox.showinfo("Akrem Cam", "Camera repaired. Restart Zoom / Telegram / OBS so they see it.")
+            messagebox.showinfo("CamBridge", "Camera repaired. Restart Zoom / Telegram / OBS so they see it.")
         else:
-            messagebox.showwarning("Akrem Cam", "The camera could not be installed. Click Repair again "
+            messagebox.showwarning("CamBridge", "The camera could not be installed. Click Repair again "
                                                 "and choose “Yes” when Windows asks.")
 
     # ---- pause / record ----------------------------------------------------------
@@ -933,8 +938,8 @@ class App:
                 self.settings["tray_tip_shown"] = True
                 self.settings.save()
                 try:
-                    self.tray.notify("Akrem Cam is still running. Right-click its icon next to the clock "
-                                     "to open or quit.", "Akrem Cam")
+                    self.tray.notify("CamBridge is still running. Right-click its icon next to the clock "
+                                     "to open or quit.", "CamBridge")
                 except Exception:
                     pass
         else:
@@ -962,6 +967,123 @@ class App:
                 pass
         self.root.after(500, self.root.destroy)
 
+    # ---- Wi-Fi ---------------------------------------------------------------------
+
+    def open_wifi(self):
+        import wifi as wifimod
+        if self.wifi_window is not None and self.wifi_window.winfo_exists():
+            self.wifi_window.lift()
+            return
+        win = tk.Toplevel(self.root, bg=C["bg"], padx=22, pady=18)
+        win.title("Connect a phone over Wi-Fi")
+        win.resizable(False, False)
+        self.wifi_window = win
+        try:
+            win.iconbitmap(self._resource("icon.ico"))
+        except Exception:
+            pass
+
+        tk.Label(win, text="Connect a phone over Wi-Fi", font=(FONT, 15, "bold"), bg=C["bg"],
+                 fg=C["fg"]).grid(row=0, column=0, columnspan=2, sticky="w")
+        tk.Label(win, text="The phone and this PC must be on the same Wi-Fi network.", font=(FONT, 9),
+                 bg=C["bg"], fg=C["dim"]).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 14))
+
+        qr_box = tk.Label(win, bg="#ffffff", bd=0)
+        qr_box.grid(row=2, column=0, sticky="n")
+
+        steps = tk.Frame(win, bg=C["bg"])
+        steps.grid(row=2, column=1, sticky="nw", padx=(20, 0))
+        for i, (title, text) in enumerate((
+            ("Scan the code", "Open CamBridge on the phone, tap Wi-Fi → Scan QR code.\n"
+                              "On iPhone you can also scan it with the normal Camera app."),
+            ("…or just pick this PC", "In CamBridge on the phone, tap Wi-Fi and choose “%s”.\n"
+                                      "The first time, click Allow here on the PC." % wifimod.pc_name()),
+            ("Next time", "Remembered phones connect by themselves — just open the app."),
+        )):
+            tk.Label(steps, text="%d.  %s" % (i + 1, title), font=(FONT, 10, "bold"), bg=C["bg"],
+                     fg=C["fg"], anchor="w").pack(fill="x", pady=(0 if i == 0 else 10, 2))
+            tk.Label(steps, text=text, font=(FONT, 9), bg=C["bg"], fg=C["dim"], justify="left",
+                     anchor="w").pack(fill="x")
+        addr = tk.Label(steps, text="", font=(FONT, 8), bg=C["bg"], fg=C["faint"], justify="left", anchor="w")
+        addr.pack(fill="x", pady=(14, 0))
+        if self.wifi is not None and self.wifi.error:
+            tk.Label(steps, text=self.wifi.error, font=(FONT, 9, "bold"), bg=C["bg"], fg=C["red"],
+                     anchor="w").pack(fill="x", pady=(6, 0))
+
+        trusted_card = tk.Frame(win, bg=C["card"], padx=12, pady=10)
+        trusted_card.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        tk.Label(trusted_card, text="REMEMBERED PHONES", font=(FONT, 8, "bold"), bg=C["card"],
+                 fg=C["dim"], anchor="w").pack(fill="x")
+        trusted_list = tk.Frame(trusted_card, bg=C["card"])
+        trusted_list.pack(fill="x", pady=(6, 0))
+
+        def refresh():
+            url = wifimod.pairing_url(self.settings)
+            self.qr_photo = ImageTk.PhotoImage(wifimod.qr_image(url, 260))
+            qr_box.configure(image=self.qr_photo)
+            ips = wifimod.local_ipv4s()
+            addr.configure(text="This PC: %s  ·  port %d" % (", ".join(ips) or "no network found", wifimod.WIFI_PORT))
+            for w in trusted_list.winfo_children():
+                w.destroy()
+            trusted = self.settings["trusted"]
+            if not trusted:
+                tk.Label(trusted_list, text="None yet.", font=(FONT, 9), bg=C["card"], fg=C["faint"],
+                         anchor="w").pack(fill="x")
+            for device_id, name in list(trusted.items()):
+                row = tk.Frame(trusted_list, bg=C["card"])
+                row.pack(fill="x", pady=1)
+                tk.Label(row, text=name, font=(FONT, 9), bg=C["card"], fg=C["fg"], anchor="w").pack(side="left")
+                flat_button(row, "Forget", lambda d=device_id: forget(d), pady=2).pack(side="right")
+
+        def forget(device_id):
+            self.settings["trusted"].pop(device_id, None)
+            self.settings.save()
+            refresh()
+
+        def new_code():
+            self.settings["pair_key"] = ""
+            self.settings["trusted"] = {}
+            wifimod.ensure_identity(self.settings)
+            refresh()
+            self.show_toast("New QR code made — phones must pair again")
+
+        bottom = tk.Frame(win, bg=C["bg"])
+        bottom.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        flat_button(bottom, "Make a new code (forget all phones)", new_code).pack(side="left")
+        flat_button(bottom, "Close", win.destroy, bg=C["accent"], fg=C["accent_fg"], bold=True).pack(side="right")
+        refresh()
+
+    def ask_approval(self, request):
+        self.show()
+        win = tk.Toplevel(self.root, bg=C["bg"], padx=24, pady=20)
+        win.title("New phone wants to connect")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        tk.Label(win, text="Allow “%s” to connect?" % request.device, font=(FONT, 13, "bold"),
+                 bg=C["bg"], fg=C["fg"]).pack(anchor="w")
+        tk.Label(win, text="It wants to send its camera to this PC over Wi-Fi.\n"
+                           "Only allow phones you own. Allowed phones are remembered.",
+                 font=(FONT, 9), bg=C["bg"], fg=C["dim"], justify="left").pack(anchor="w", pady=(6, 14))
+        row = tk.Frame(win, bg=C["bg"])
+        row.pack(fill="x")
+
+        def decide(allowed):
+            request.answer(allowed)
+            if win.winfo_exists():
+                win.destroy()
+            self.show_toast(("Allowed " if allowed else "Blocked ") + request.device)
+
+        flat_button(row, "Allow", lambda: decide(True), bg=C["accent"], fg=C["accent_fg"], bold=True,
+                    padx=18, pady=6).pack(side="right")
+        flat_button(row, "Deny", lambda: decide(False), padx=18, pady=6).pack(side="right", padx=8)
+        win.protocol("WM_DELETE_WINDOW", lambda: decide(False))
+        win.after(58000, lambda: win.winfo_exists() and decide(False))
+        if self.tray:
+            try:
+                self.tray.notify("“%s” wants to connect over Wi-Fi." % request.device, "CamBridge")
+            except Exception:
+                pass
+
     # ---- refresh loop ------------------------------------------------------------
 
     def _tick(self):
@@ -974,6 +1096,13 @@ class App:
                 break
             {"show": self.show, "pause": self.toggle_pause, "record": self.toggle_record,
              "quit": self.quit}.get(action, lambda: None)()
+        if self.wifi is not None:
+            try:
+                request = self.wifi.requests.get_nowait()
+            except queue.Empty:
+                request = None
+            if request is not None:
+                self.ask_approval(request)
 
         state, status, detail, info = self.link.snapshot()
         if self.pump.error:

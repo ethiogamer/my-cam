@@ -1,4 +1,4 @@
-name: Build Akrem Cam
+name: Build CamBridge
 
 on:
   push:
@@ -30,8 +30,8 @@ jobs:
         run: |
           set -o pipefail
           xcodebuild \
-            -project AkremCam.xcodeproj \
-            -scheme AkremCam \
+            -project CamBridge.xcodeproj \
+            -scheme CamBridge \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
@@ -43,14 +43,14 @@ jobs:
         working-directory: ios
         run: |
           mkdir -p Payload
-          cp -R build/Build/Products/Release-iphoneos/AkremCam.app Payload/
-          zip -qr AkremCam.ipa Payload
-          ls -la AkremCam.ipa
+          cp -R build/Build/Products/Release-iphoneos/CamBridge.app Payload/
+          zip -qr CamBridge.ipa Payload
+          ls -la CamBridge.ipa
 
       - uses: actions/upload-artifact@v4
         with:
-          name: AkremCam-iPhone
-          path: ios/AkremCam.ipa
+          name: CamBridge-iPhone
+          path: ios/CamBridge.ipa
 
   android:
     name: Android app (.apk)
@@ -73,13 +73,13 @@ jobs:
 
       - name: Collect APK
         run: |
-          cp android/app/build/outputs/apk/release/app-release.apk AkremCam.apk
-          ls -la AkremCam.apk
+          cp android/app/build/outputs/apk/release/app-release.apk CamBridge.apk
+          ls -la CamBridge.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: AkremCam-Android
-          path: AkremCam.apk
+          name: CamBridge-Android
+          path: CamBridge.apk
 
   windows:
     name: Windows app (.exe)
@@ -94,15 +94,15 @@ jobs:
           git clone https://github.com/tshino/softcam.git ext/softcam
           cd ext/softcam && git checkout "$SOFTCAM_COMMIT"
 
-      - name: Rename the camera to "Akrem Cam"
+      - name: Rename the camera to "CamBridge"
         shell: pwsh
         run: |
           $f = "ext/softcam/src/softcam/softcam.cpp"
           $s = Get-Content $f -Raw
-          $s = $s.Replace('L"DirectShow Softcam"', 'L"Akrem Cam"')
+          $s = $s.Replace('L"DirectShow Softcam"', 'L"CamBridge"')
           $s = $s.Replace('0xaef3b972, 0x5fa5, 0x4647, 0x95, 0x71, 0x35, 0x8e, 0xb4, 0x72, 0xbc, 0x9e',
                           '0x58ea431c, 0x1871, 0x4d1e, 0xb6, 0x0c, 0x5e, 0xa9, 0x92, 0xf2, 0x66, 0x70')
-          if (-not $s.Contains('L"Akrem Cam"')) { throw "name patch failed" }
+          if (-not $s.Contains('L"CamBridge"')) { throw "name patch failed" }
           if (-not $s.Contains('0x58ea431c')) { throw "id patch failed" }
           Set-Content $f $s -NoNewline
 
@@ -119,14 +119,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p windows/bin
-          cp ext/softcam/x64/Release/softcam.dll windows/bin/akremcam64.dll
-          cp ext/softcam/Win32/Release/softcam.dll windows/bin/akremcam32.dll
+          cp ext/softcam/x64/Release/softcam.dll windows/bin/cambridge64.dll
+          cp ext/softcam/Win32/Release/softcam.dll windows/bin/cambridge32.dll
           ls -la windows/bin
 
       - name: Get the Android app (to install it on phones automatically)
         uses: actions/download-artifact@v4
         with:
-          name: AkremCam-Android
+          name: CamBridge-Android
           path: windows/bin
 
       - name: Get Android USB tool (adb)
@@ -143,39 +143,41 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python tools
-        run: python -m pip install pillow pyinstaller pystray
+        run: python -m pip install pillow pyinstaller pystray zeroconf qrcode
 
       - name: Self-test (source)
         working-directory: windows
-        run: python akremcam.py --selftest
+        run: python cambridge.py --selftest
 
-      - name: Build AkremCam.exe
+      - name: Build CamBridge.exe
         working-directory: windows
         run: >
-          pyinstaller --noconfirm --onefile --windowed --name AkremCam
+          pyinstaller --noconfirm --onefile --windowed --name CamBridge
           --icon icon.ico
           --add-data "icon.ico;."
-          --add-binary "bin/akremcam64.dll;."
-          --add-binary "bin/akremcam32.dll;."
+          --add-binary "bin/cambridge64.dll;."
+          --add-binary "bin/cambridge32.dll;."
           --add-binary "bin/platform-tools/adb.exe;platform-tools"
           --add-binary "bin/platform-tools/AdbWinApi.dll;platform-tools"
           --add-binary "bin/platform-tools/AdbWinUsbApi.dll;platform-tools"
-          --add-data "bin/AkremCam.apk;."
+          --add-data "bin/CamBridge.apk;."
           --hidden-import pystray._win32
-          akremcam.py
+          --collect-submodules zeroconf
+          --hidden-import ifaddr
+          cambridge.py
 
       - name: Self-test (finished .exe)
         working-directory: windows
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath dist/AkremCam.exe -ArgumentList "--selftest" -Wait -PassThru
+          $p = Start-Process -FilePath dist/CamBridge.exe -ArgumentList "--selftest" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "exe self-test failed: $($p.ExitCode)" }
-          Get-Item dist/AkremCam.exe | Select-Object Name, Length
+          Get-Item dist/CamBridge.exe | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
-          name: AkremCam-Windows
-          path: windows/dist/AkremCam.exe
+          name: CamBridge-Windows
+          path: windows/dist/CamBridge.exe
 
   release:
     name: Publish downloads
@@ -193,6 +195,6 @@ jobs:
         run: |
           gh release delete latest --repo "$REPO" --yes --cleanup-tag || true
           gh release create latest --repo "$REPO" \
-            --title "Akrem Cam (latest)" \
-            --notes "AkremCam.exe → run on Windows (works with iPhone and Android). AkremCam.apk → Android app (the PC installs it for you). AkremCam.ipa → iPhone app, install with Sideloadly. Built from ${GITHUB_SHA::7}." \
-            out/AkremCam-iPhone/AkremCam.ipa out/AkremCam-Windows/AkremCam.exe out/AkremCam-Android/AkremCam.apk
+            --title "CamBridge (latest)" \
+            --notes "CamBridge.exe → run on Windows (works with iPhone and Android). CamBridge.apk → Android app (the PC installs it for you). CamBridge.ipa → iPhone app, install with Sideloadly. Built from ${GITHUB_SHA::7}." \
+            out/CamBridge-iPhone/CamBridge.ipa out/CamBridge-Windows/CamBridge.exe out/CamBridge-Android/CamBridge.apk

@@ -1,7 +1,8 @@
-package com.akrem.cam
+package com.cambridgecam.app
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -41,6 +42,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var permissionView: LinearLayout
     private lateinit var server: StreamServer
     private lateinit var camera: CameraController
+    private lateinit var wifi: WifiLink
+    private lateinit var scanBanner: TextView
     private val handler = Handler(Looper.getMainLooper())
     private var fps = 0
     private var started = false
@@ -71,8 +74,12 @@ class MainActivity : ComponentActivity() {
         )
         camera = CameraController(this, previewView, server,
             onScreenOff = { off -> showDark(off) },
-            onChanged = { updateStatus() })
+            onChanged = { updateStatus() },
+            onQr = { text -> wifi.handleUrl(text); updateStatus() })
         server.start()
+        wifi = WifiLink(this, server) { runOnUiThread { updateStatus() } }
+        wifi.start()
+        handleLink(intent)
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startCamera()
@@ -89,8 +96,53 @@ class MainActivity : ComponentActivity() {
         camera.start()
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleLink(intent)
+    }
+
+    /** Opened from the QR code with the phone's normal camera / Google Lens. */
+    private fun handleLink(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (data.scheme == "cambridge") wifi.handleUrl(data.toString())
+    }
+
+    private fun showWifiDialog() {
+        val labels = ArrayList<String>()
+        val actions = ArrayList<() -> Unit>()
+        for (pc in wifi.found.values) {
+            val tag = when {
+                wifi.connectedPC == pc.name -> "   ✓ connected"
+                wifi.saved.containsKey(pc.id) -> "   (paired)"
+                else -> ""
+            }
+            labels.add("💻  ${pc.name}$tag")
+            actions.add { wifi.connect(pc) }
+        }
+        if (wifi.found.isEmpty()) {
+            labels.add("Looking for PCs… (open CamBridge on the PC)")
+            actions.add { handler.postDelayed({ showWifiDialog() }, 300) }
+        }
+        labels.add("📷  Scan QR code on the PC")
+        actions.add { camera.scanning = true; updateStatus() }
+        if (wifi.connectedPC != null) {
+            labels.add("Disconnect Wi-Fi")
+            actions.add { wifi.disconnect() }
+        }
+        for (pc in wifi.saved.values.toList()) {
+            labels.add("Forget ${pc.name}")
+            actions.add { wifi.forget(pc.id) }
+        }
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle(if (wifi.status.isEmpty()) "Connect over Wi-Fi" else wifi.status)
+            .setItems(labels.toTypedArray()) { _, which -> actions[which]() }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
     override fun onDestroy() {
         handler.removeCallbacks(ticker)
+        if (::wifi.isInitialized) wifi.stop()
         camera.stop()
         server.stop()
         super.onDestroy()
@@ -127,7 +179,7 @@ class MainActivity : ComponentActivity() {
         label(text, 14f, bold = true).apply {
             gravity = Gravity.CENTER
             background = pill(Color.argb(150, 0, 0, 0))
-            setPadding(dp(14), dp(10), dp(14), dp(10))
+            setPadding(dp(11), dp(10), dp(11), dp(10))
             setOnClickListener { onClick() }
         }
 
@@ -158,7 +210,7 @@ class MainActivity : ComponentActivity() {
         status.addView(statusDot, LinearLayout.LayoutParams(dp(12), dp(12)).apply { rightMargin = dp(12) })
         val texts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         statusTitle = label("Waiting for PC", 16f, bold = true)
-        statusSub = label("Plug in the cable and open Akrem Cam on the PC", 12f, color = Color.argb(200, 255, 255, 255))
+        statusSub = label("Plug in the cable and open CamBridge on the PC", 12f, color = Color.argb(200, 255, 255, 255))
         texts.addView(statusTitle)
         texts.addView(statusSub)
         status.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -171,18 +223,29 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.CENTER_HORIZONTAL
         }
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        val gap = { LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(dp(5), 0, dp(5), 0) } }
+        val gap = { LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(dp(3), 0, dp(3), 0) } }
         bar.addView(button("⟲ Flip") { camera.switchCamera() }, gap())
         torchButton = button("Light") { camera.toggleTorch() }
         bar.addView(torchButton, gap())
         qualityButton = button("1080p") { camera.toggleQuality() }
         bar.addView(qualityButton, gap())
+        bar.addView(button("Wi-Fi") { showWifiDialog() }, gap())
         bar.addView(button("Dark") { camera.setScreenOff(true) }, gap())
         bottom.addView(bar)
-        bottom.addView(label("Control zoom, exposure, focus and more from Akrem Cam on your PC.", 11f,
+        bottom.addView(label("Control zoom, exposure, focus and more from CamBridge on your PC.", 11f,
             color = Color.argb(160, 255, 255, 255)).apply { gravity = Gravity.CENTER; setPadding(dp(20), dp(10), dp(20), 0) })
         val bottomParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM)
         root.addView(bottom, bottomParams)
+
+        // QR scanning banner
+        scanBanner = label("Point at the QR code on your PC\n\nTap here to cancel", 16f, bold = true).apply {
+            gravity = Gravity.CENTER
+            background = pill(Color.argb(170, 0, 0, 0), 18)
+            setPadding(dp(24), dp(18), dp(24), dp(18))
+            visibility = View.GONE
+            setOnClickListener { camera.scanning = false; updateStatus() }
+        }
+        root.addView(scanBanner, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
 
         // Permission message
         permissionView = LinearLayout(this).apply {
@@ -191,7 +254,7 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(Color.BLACK)
             visibility = View.GONE
             addView(label("Camera access is off", 20f, bold = true).apply { gravity = Gravity.CENTER })
-            addView(label("Akrem Cam needs the camera to work as your PC webcam.", 14f,
+            addView(label("CamBridge needs the camera to work as your PC webcam.", 14f,
                 color = Color.argb(190, 255, 255, 255)).apply { gravity = Gravity.CENTER; setPadding(dp(30), dp(10), dp(30), dp(20)) })
             addView(button("Open settings") {
                 startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
@@ -235,11 +298,17 @@ class MainActivity : ComponentActivity() {
         val connected = server.isConnected
         statusDot.background = pill(if (connected) Color.rgb(34, 197, 94) else Color.rgb(245, 158, 11), 6)
         statusTitle.text = if (connected) "Connected to PC" else "Waiting for PC"
-        statusSub.text = when {
-            connected && camera.hot -> "$fps fps · phone is hot — remove the case"
-            connected -> "$fps fps · ${camera.quality}"
-            else -> "Plug in the cable and open Akrem Cam on the PC"
+        val how = if (server.isWifi) "Wi-Fi" else "USB"
+        if (connected && ::wifi.isInitialized && wifi.connectedPC != null && server.isWifi) {
+            statusTitle.text = "Connected to ${wifi.connectedPC}"
         }
+        statusSub.text = when {
+            connected && camera.hot -> "$fps fps · $how · phone is hot — remove the case"
+            connected -> "$fps fps · ${camera.quality} · $how"
+            ::wifi.isInitialized && wifi.status.isNotEmpty() -> wifi.status
+            else -> "Plug in the cable, or tap Wi-Fi below"
+        }
+        scanBanner.visibility = if (camera.scanning) View.VISIBLE else View.GONE
         darkText.text = if (connected) "Streaming to PC\nTap anywhere to wake" else "Waiting for PC\nTap anywhere to wake"
         torchButton.visibility = if (camera.hasTorch) View.VISIBLE else View.GONE
         torchButton.background = pill(if (camera.torchOn) Color.rgb(245, 197, 24) else Color.argb(150, 0, 0, 0))

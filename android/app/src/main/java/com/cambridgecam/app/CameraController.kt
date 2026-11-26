@@ -1,4 +1,4 @@
-package com.akrem.cam
+package com.cambridgecam.app
 
 import android.annotation.SuppressLint
 import android.content.Context
@@ -32,6 +32,12 @@ import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.DecodeHintType
+import com.google.zxing.MultiFormatReader
+import com.google.zxing.PlanarYUVLuminanceSource
+import com.google.zxing.common.HybridBinarizer
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Executors
@@ -51,8 +57,18 @@ class CameraController(
     private val server: StreamServer,
     private val onScreenOff: (Boolean) -> Unit,
     private val onChanged: () -> Unit,
+    private val onQr: (String) -> Unit,
 ) {
-    private val prefs = activity.getSharedPreferences("akremcam", Context.MODE_PRIVATE)
+    /** Looking for the pairing QR code on the PC screen. */
+    @Volatile var scanning = false
+    private var scanCounter = 0
+    private val qrReader = MultiFormatReader().apply {
+        setHints(mapOf(
+            DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
+            DecodeHintType.TRY_HARDER to true,
+        ))
+    }
+    private val prefs = activity.getSharedPreferences("cambridge", Context.MODE_PRIVATE)
 
     // ---- settings
     var front = prefs.getBoolean("front", false); private set
@@ -247,6 +263,17 @@ class CameraController(
                 frameHeight = image.height
                 sendInfo()
             }
+            if (scanning) {
+                scanCounter++
+                if (scanCounter % 3 == 0) {
+                    decodeQr(image)?.let { text ->
+                        if (text.startsWith("cambridge://")) {
+                            scanning = false
+                            activity.runOnUiThread { onQr(text) }
+                        }
+                    }
+                }
+            }
             if (!server.isReadyForFrame) return
             if (hot) {
                 skipToggle = !skipToggle
@@ -256,6 +283,23 @@ class CameraController(
         } catch (_: Exception) {
         } finally {
             image.close()
+        }
+    }
+
+    private fun decodeQr(image: ImageProxy): String? {
+        val plane = image.planes[0]
+        val buffer = plane.buffer
+        buffer.rewind()
+        val data = ByteArray(buffer.remaining())
+        buffer.get(data)
+        val source = PlanarYUVLuminanceSource(data, plane.rowStride, image.height, 0, 0,
+            image.width, image.height, false)
+        return try {
+            qrReader.decodeWithState(BinaryBitmap(HybridBinarizer(source))).text
+        } catch (_: Exception) {
+            null
+        } finally {
+            qrReader.reset()
         }
     }
 
@@ -447,7 +491,7 @@ class CameraController(
         if (maxZoom >= 2f) lenses.put("Zoom")
         val info = JSONObject()
         try {
-            info.put("app", "Akrem Cam")
+            info.put("app", "CamBridge")
             info.put("platform", "android")
             info.put("device", "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}")
             info.put("camera", if (front) "Front" else "Back")

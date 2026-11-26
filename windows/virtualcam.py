@@ -1,4 +1,4 @@
-"""The "Akrem Cam" virtual webcam (a renamed build of the open-source Softcam library).
+"""The "CamBridge" virtual webcam (a renamed build of the open-source Softcam library).
 
 The DLL must be registered once (needs admin) so Zoom, Telegram, OBS, etc. can see the
 camera. After that, this program just pushes pictures into it.
@@ -11,15 +11,15 @@ import shutil
 import subprocess
 import sys
 
-CAMERA_NAME = "Akrem Cam"
+CAMERA_NAME = "CamBridge"
 CLSID = "{58EA431C-1871-4D1E-B60C-5EA992F26670}"
-DLL64 = "akremcam64.dll"
-DLL32 = "akremcam32.dll"
+DLL64 = "cambridge64.dll"
+DLL32 = "cambridge32.dll"
 
 
 def app_data_dir():
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    path = os.path.join(base, "AkremCam")
+    path = os.path.join(base, "CamBridge")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -146,7 +146,7 @@ class VirtualCamera:
         # framerate 0 = deliver each picture as soon as it arrives (lowest delay)
         self._cam = self._dll.scCreateCamera(width, height, 0.0)
         if not self._cam:
-            raise RuntimeError("Akrem Cam is already running (only one copy can run).")
+            raise RuntimeError("CamBridge is already running (only one copy can run).")
 
     def send(self, bgr_bytes):
         """`bgr_bytes`: width*height*3 bytes, top row first, Blue-Green-Red order."""

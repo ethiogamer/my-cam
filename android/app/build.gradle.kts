@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.akrem.cam"
+    namespace = "com.cambridgecam.app"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.akrem.cam"
+        applicationId = "com.cambridgecam.app"
         minSdk = 24
         targetSdk = 35
         versionCode = 1
@@ -18,7 +18,7 @@ android {
     // A fixed key, so every new build installs over the old one (no uninstall needed).
     signingConfigs {
         create("fixed") {
-            storeFile = file("akremcam-debug.keystore")
+            storeFile = file("cambridge-debug.keystore")
             storePassword = "android"
             keyAlias = "androiddebugkey"
             keyPassword = "android"
@@ -53,4 +53,5 @@ dependencies {
     implementation("androidx.camera:camera-view:$camerax")
     implementation("androidx.activity:activity-ktx:1.9.3")
     implementation("androidx.core:core-ktx:1.13.1")
+    implementation("com.google.zxing:core:3.5.3")
 }

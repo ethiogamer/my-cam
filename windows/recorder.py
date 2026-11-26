@@ -13,7 +13,7 @@ def recordings_dir():
     home = os.path.expanduser("~")
     for base in (os.path.join(home, "Videos"), home):
         if os.path.isdir(base):
-            path = os.path.join(base, "Akrem Cam")
+            path = os.path.join(base, "CamBridge")
             os.makedirs(path, exist_ok=True)
             return path
     return home
@@ -37,7 +37,7 @@ class AviRecorder:
     def _open(self):
         self.part += 1
         suffix = "" if self.part == 1 else " (part %d)" % self.part
-        path = os.path.join(self.folder, "Akrem Cam %s%s.avi" % (self.stamp, suffix))
+        path = os.path.join(self.folder, "CamBridge %s%s.avi" % (self.stamp, suffix))
         self.files.append(path)
         self._f = open(path, "wb")
         self._index = []

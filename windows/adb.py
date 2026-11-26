@@ -1,7 +1,7 @@
-"""Android phones over USB, using Google's adb tool (bundled with Akrem Cam).
+"""Android phones over USB, using Google's adb tool (bundled with CamBridge).
 
 The phone needs "USB debugging" turned on once (Settings → Developer options).
-We then ask adb to forward a PC port to the Akrem Cam app's port inside the phone.
+We then ask adb to forward a PC port to the CamBridge app's port inside the phone.
 """
 
 import os
@@ -97,16 +97,16 @@ def remove_forward(serial, pc_port):
 
 def app_running(serial):
     try:
-        out = _run(["-s", serial, "shell", "pidof", "com.akrem.cam"], timeout=5)
+        out = _run(["-s", serial, "shell", "pidof", "com.cambridgecam.app"], timeout=5)
         return bool(out.strip())
     except AdbError:
         return False
 
 
 def launch_app(serial):
-    """Opens the Akrem Cam app on the phone (works when the phone is unlocked)."""
+    """Opens the CamBridge app on the phone (works when the phone is unlocked)."""
     try:
-        _run(["-s", serial, "shell", "monkey", "-p", "com.akrem.cam", "-c",
+        _run(["-s", serial, "shell", "monkey", "-p", "com.cambridgecam.app", "-c",
               "android.intent.category.LAUNCHER", "1"], timeout=8)
         return True
     except AdbError:
@@ -115,8 +115,8 @@ def launch_app(serial):
 
 def installed(serial):
     try:
-        out = _run(["-s", serial, "shell", "pm", "list", "packages", "com.akrem.cam"], timeout=8)
-        return "package:com.akrem.cam" in out
+        out = _run(["-s", serial, "shell", "pm", "list", "packages", "com.cambridgecam.app"], timeout=8)
+        return "package:com.cambridgecam.app" in out
     except AdbError:
         return True  # can't tell — assume yes rather than reinstalling
 
@@ -126,5 +126,5 @@ def install(serial, apk_path):
 
 
 def bundled_apk():
-    path = os.path.join(virtualcam.bundled_dir(), "AkremCam.apk")
+    path = os.path.join(virtualcam.bundled_dir(), "CamBridge.apk")
     return path if os.path.exists(path) else None

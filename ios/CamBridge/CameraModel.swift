@@ -166,9 +166,16 @@ final class CameraModel: NSObject, ObservableObject {
 
     let session = AVCaptureSession()
     let server = StreamServer()
+    let wifi = WifiManager()
 
-    private let sessionQueue = DispatchQueue(label: "akremcam.session")
-    private let videoQueue = DispatchQueue(label: "akremcam.video", qos: .userInteractive)
+    /// Looking for the pairing QR code on the PC screen.
+    @Published var scanning = false {
+        didSet { guard scanning != oldValue else { return }; applyScanning() }
+    }
+    private let metadataOutput = AVCaptureMetadataOutput()
+
+    private let sessionQueue = DispatchQueue(label: "cambridge.session")
+    private let videoQueue = DispatchQueue(label: "cambridge.video", qos: .userInteractive)
     private let videoOutput = AVCaptureVideoDataOutput()
     private var videoInput: AVCaptureDeviceInput?
     private let encoder = JPEGEncoder()
@@ -225,6 +232,7 @@ final class CameraModel: NSObject, ObservableObject {
             DispatchQueue.main.async { self?.handle(command: command) }
         }
         server.start()
+        wifi.start(server: server)
 
         fpsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
@@ -403,9 +411,14 @@ final class CameraModel: NSObject, ObservableObject {
             }
         }
 
+        if !session.outputs.contains(metadataOutput), session.canAddOutput(metadataOutput) {
+            session.addOutput(metadataOutput)
+            metadataOutput.setMetadataObjectsDelegate(self, queue: .main)
+        }
         applyConnectionSettings()
         session.commitConfiguration()
         if locked { device.unlockForConfiguration() }
+        DispatchQueue.main.async { self.applyScanning() }
 
         let maxZ = min(device.activeFormat.videoMaxZoomFactor, CameraModel.zoomLimit)
         let hasTorch = device.hasTorch
@@ -639,6 +652,17 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - QR code scanning (Wi-Fi pairing)
+
+    private func applyScanning() {
+        let wanted = scanning
+        sessionQueue.async {
+            let types: [AVMetadataObject.ObjectType] =
+                wanted && self.metadataOutput.availableMetadataObjectTypes.contains(.qr) ? [.qr] : []
+            self.metadataOutput.metadataObjectTypes = types
+        }
+    }
+
     // MARK: - Focus
 
     /// `point` is in camera coordinates (0...1).
@@ -675,7 +699,7 @@ final class CameraModel: NSObject, ObservableObject {
             return
         }
         var info: [String: Any] = [
-            "app": "Akrem Cam",
+            "app": "CamBridge",
             "device": UIDevice.current.name,
             "camera": side.rawValue,
             "lens": lens.rawValue,
@@ -750,6 +774,25 @@ final class CameraModel: NSObject, ObservableObject {
         mirror = d.bool(forKey: "mirror")
         stabilization = d.bool(forKey: "stabilization")
         hdr = d.bool(forKey: "hdr")
+    }
+}
+
+// MARK: - QR codes
+
+extension CameraModel: AVCaptureMetadataOutputObjectsDelegate {
+    func metadataOutput(_ output: AVCaptureMetadataOutput,
+                        didOutput metadataObjects: [AVMetadataObject],
+                        from connection: AVCaptureConnection) {
+        guard scanning else { return }
+        for object in metadataObjects {
+            guard let code = object as? AVMetadataMachineReadableCodeObject,
+                  let text = code.stringValue, let url = URL(string: text),
+                  url.scheme == "cambridge" else { continue }
+            scanning = false
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            wifi.handle(url: url)
+            return
+        }
     }
 }
 

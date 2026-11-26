@@ -1,6 +1,6 @@
-name: AkremCam
+name: CamBridge
 options:
-  bundleIdPrefix: com.akrem
+  bundleIdPrefix: com.cambridgecam
   deploymentTarget:
     iOS: "15.0"
 settings:
@@ -9,15 +9,15 @@ settings:
     MARKETING_VERSION: "1.0"
     CURRENT_PROJECT_VERSION: "1"
 targets:
-  AkremCam:
+  CamBridge:
     type: application
     platform: iOS
     sources:
-      - AkremCam
+      - CamBridge
     info:
-      path: AkremCam/Info.plist
+      path: CamBridge/Info.plist
       properties:
-        CFBundleDisplayName: Akrem Cam
+        CFBundleDisplayName: CamBridge
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
@@ -27,11 +27,17 @@ targets:
           - UIInterfaceOrientationPortrait
         UISupportedInterfaceOrientations~ipad:
           - UIInterfaceOrientationPortrait
-        NSCameraUsageDescription: Akrem Cam uses the camera to send live video to your PC as a webcam.
-        NSLocalNetworkUsageDescription: Akrem Cam sends video to your PC over the USB cable.
+        NSCameraUsageDescription: CamBridge uses the camera to send live video to your PC as a webcam.
+        NSLocalNetworkUsageDescription: CamBridge finds your PC on Wi-Fi and sends it your camera video.
+        NSBonjourServices:
+          - _cambridge._tcp
+        CFBundleURLTypes:
+          - CFBundleURLName: com.cambridgecam.app
+            CFBundleURLSchemes:
+              - cambridge
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.akrem.cam
+        PRODUCT_BUNDLE_IDENTIFIER: com.cambridgecam.app
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGNING_ALLOWED: "NO"
