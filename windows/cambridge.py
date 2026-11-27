@@ -200,7 +200,7 @@ class PhoneLink(threading.Thread):
         self.audio = None          # AudioHub
         self.audio_wanted = False
         self.on_connect = {}       # extra settings sent to every phone that connects
-        self.video_note = ""       # shown when the PC had to switch the phone to JPEG
+        self.has_video = False     # any video received from the connected phone
         self.bytes_in = 0
         self._wifi = queue.Queue()
         self.transport = ""
@@ -415,19 +415,15 @@ class PhoneLink(threading.Thread):
         idle_since = time.monotonic()
         started = idle_since
         got_video = False
-        asked_jpeg = False
+        self.has_video = False
+        reported = False
         connected_status = self.status
         while self.running:
-            # Safety net: connected but no video from the phone's video chip -> ask for JPEG.
-            if not got_video and not asked_jpeg and time.monotonic() - started > 4:
-                codec = str(self.info.get("codec", "")).lower()
-                if codec in ("h264", "hevc"):
-                    asked_jpeg = True
-                    log.warning("no %s video from phone (%s); asking for JPEG", codec,
-                                self.info.get("encoderError") or "no error reported")
-                    self.video_note = "The phone's %s video didn't start, so CamBridge switched to JPEG." % (
-                        "H.264" if codec == "h264" else "HEVC")
-                    self.send_command(codec="jpeg")
+            # No video after a few seconds: record the phone's own report of where it stops.
+            if not got_video and not reported and time.monotonic() - started > 4:
+                reported = True
+                log.warning("no video from phone: codec=%s pipeline=%s", self.info.get("codec"),
+                            self.info.get("pipeline", "(phone app too old to report)"))
             try:
                 msg_type, payload = read_message(sock)
             except socket.timeout:
@@ -438,6 +434,7 @@ class PhoneLink(threading.Thread):
             self._on_message(msg_type, payload)
             if msg_type in (MSG_JPEG, MSG_H264, MSG_HEVC):
                 got_video = True
+                self.has_video = True
                 idle_since = time.monotonic()
                 if self.status != connected_status:
                     self._set("connected", connected_status, "")

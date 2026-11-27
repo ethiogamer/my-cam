@@ -543,7 +543,7 @@ class App:
         self.preview.bind("<B1-Motion>", self._drag_move)
         self.preview.bind("<ButtonRelease-1>", lambda e: setattr(self, "drag_from", None))
         self.preview.bind("<Double-Button-1>", lambda e: self.reset_framing())
-        self.warning = tk.Label(parent, text="", font=(FONT, 9, "bold"), bg=C["bg"], fg=C["orange"])
+        self.warning = tk.Label(parent, text="", font=(FONT, 9, "bold"), bg=C["bg"], fg=C["orange"], wraplength=700, justify="center")
         self.warning.pack(fill="x", padx=12, pady=(0, 8))
 
     def _preview_box(self):
@@ -1453,9 +1453,9 @@ class App:
             warnings.append("Phone is hot — take it out of its case or choose 30 fps.")
         if info.get("fps") and info.get("actualFps") and info["actualFps"] < info["fps"]:
             warnings.append("This lens can't do %s fps; using %s." % (info["fps"], info["actualFps"]))
-        note = info.get("videoNote") or (self.link.video_note if self.connected else "")
-        if note and info.get("codec") == "jpeg":
-            warnings.append(note)
+        if self.connected and not getattr(self.link, "has_video", True):
+            warnings.append("No video from phone — " + (info.get("pipeline")
+                            or "update the CamBridge app on the phone"))
         if self.pump.record_error:
             warnings.append("Recording problem: %s" % self.pump.record_error)
         if not self.connected and detail and state != "connected":

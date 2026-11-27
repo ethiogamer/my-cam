@@ -105,7 +105,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var codec: StreamCodec = .h264 {
         didSet {
             guard codec != oldValue else { return }
-            if codec != .jpeg { videoEncoder.resetFailures(); videoNote = "" }
+            if codec != .jpeg { videoEncoder.resetFailures() }
             save(); updateEncoder(); videoEncoder.requestKeyframe(); sendInfo()
         }
     }
@@ -117,8 +117,10 @@ final class CameraModel: NSObject, ObservableObject {
     }
     /// The PC asked for the microphone.
     @Published private(set) var audioEnabled = false
-    /// Shown on the PC when the video chip failed and the app fell back to JPEG.
-    @Published private(set) var videoNote = ""
+    /// Counters for "where does the video stop?" (shown on the PC when there's no video).
+    private var capturedFrames = 0
+    private var lastCounts = (captured: 0, encodeIn: 0, encodeOut: 0)
+    private var pipeline = ""
     @Published private(set) var micDenied = false
     @Published var mirror = false {
         didSet {
@@ -302,17 +304,14 @@ final class CameraModel: NSObject, ObservableObject {
             DispatchQueue.main.async { self?.congested() }
         }
         videoEncoder.onFallback = { [weak self] _ in self?.codec = .h264 }
-        videoEncoder.onFailure = { [weak self] message in
-            guard let self = self else { return }
-            self.videoNote = message + " — switched to JPEG"
-            self.codec = .jpeg
-        }
+
         server.start()
         wifi.start(server: server)
 
         fpsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.fps = self.server.takeSentFrameCount()
+            self.updatePipeline()
             self.readLiveValues()
             self.recoverBitrate()
         }
@@ -675,6 +674,17 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
+    /// Per second: camera frames -> encoder in -> encoder out -> sent to PC.
+    private func updatePipeline() {
+        let now = (captured: capturedFrames, encodeIn: videoEncoder.encodeCalls, encodeOut: videoEncoder.encodedFrames)
+        let line = "camera \(now.captured - lastCounts.captured)/s → encoder in \(now.encodeIn - lastCounts.encodeIn)/s"
+            + " → out \(now.encodeOut - lastCounts.encodeOut)/s → sent \(fps)/s"
+            + (codec == .jpeg ? "" : " · " + videoEncoder.diagnostics())
+            + (session.isRunning ? "" : " · camera session NOT running")
+        lastCounts = now
+        pipeline = line
+    }
+
     private func applyLowLight() {
         lowLightForSession = lowLight
         let on = lowLight
@@ -969,9 +979,8 @@ final class CameraModel: NSObject, ObservableObject {
             "lowLight": lowLight,
             "audio": audioEnabled,
             "micDenied": micDenied,
-            "videoNote": videoNote,
-            "encodedFrames": videoEncoder.encodedFrames,
-            "encoderError": videoEncoder.lastError,
+            "pipeline": pipeline,
+            "sessionRunning": session.isRunning,
         ]
         if lastWidth > 0 {
             info["width"] = lastWidth
@@ -1042,6 +1051,7 @@ extension CameraModel: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAu
             if server.isConnected { handleAudio(sampleBuffer) }
             return
         }
+        capturedFrames &+= 1
         // Video (H.264 / HEVC): every frame is encoded; the link skips ahead if it falls behind.
         if streamCodecForFrames != .jpeg {
             guard server.isConnected, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }

@@ -18,12 +18,16 @@ final class VideoEncoder {
     private var forceKey = true
     /// Called when HEVC isn't available and the encoder switched to H.264 by itself.
     var onFallback: ((Codec) -> Void)?
-    /// Called (main thread) when the video chip keeps failing; the app then sends JPEG.
-    var onFailure: ((String) -> Void)?
     private var useLowLatency = false
     private var failures = 0
-    private var reportedFailure = false
+    /// Which set of settings is being tried (0 = full settings). All stages keep the same
+    /// size, frame rate and bitrate; later stages leave out optional fine-tuning that some
+    /// iPhones reject.
+    private(set) var stage = 0
+    static let stageCount = 3
     private(set) var lastError = ""
+    private(set) var rejected: [String] = []   // settings the video chip refused
+    private(set) var encodeCalls = 0
     private(set) var encodedFrames = 0
 
     deinit { invalidate() }
@@ -67,9 +71,11 @@ final class VideoEncoder {
 
     private func applyBitrate(_ s: VTCompressionSession) {
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: bitrate))
-        let bytesPerSecond = Double(bitrate) * 1.5 / 8.0
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits,
-                             value: [NSNumber(value: bytesPerSecond), NSNumber(value: 1.0)] as CFArray)
+        if stage < 2 {
+            let bytesPerSecond = Double(bitrate) * 1.5 / 8.0
+            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits,
+                                 value: [NSNumber(value: bytesPerSecond), NSNumber(value: 1.0)] as CFArray)
+        }
     }
 
     private func makeSession(width w: Int32, height h: Int32, codec c: Codec) -> VTCompressionSession? {
@@ -93,15 +99,28 @@ final class VideoEncoder {
             lastError = "create \(status)"
             return nil
         }
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
-                             value: c == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: fps))
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: fps * 2))
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: NSNumber(value: 2.0))
-        applyBitrate(session)
-        VTCompressionSessionPrepareToEncodeFrames(session)
+        rejected = []
+        func set(_ name: String, _ key: CFString, _ value: CFTypeRef) {
+            let st = VTSessionSetProperty(session, key: key, value: value)
+            if st != noErr { rejected.append("\(name) \(st)") }
+        }
+        set("realtime", kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
+        set("reorder", kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
+        if stage == 0 {
+            set("profile", kVTCompressionPropertyKey_ProfileLevel,
+                c == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel)
+        }
+        set("fps", kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: fps))
+        set("keyint", kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: fps * 2))
+        set("keydur", kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 2.0))
+        set("bitrate", kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: bitrate))
+        if stage < 2 {
+            let bytesPerSecond = Double(bitrate) * 1.5 / 8.0
+            set("limits", kVTCompressionPropertyKey_DataRateLimits,
+                [NSNumber(value: bytesPerSecond), NSNumber(value: 1.0)] as CFArray)
+        }
+        let prep = VTCompressionSessionPrepareToEncodeFrames(session)
+        if prep != noErr { rejected.append("prepare \(prep)") }
         return session
     }
 
@@ -127,7 +146,7 @@ final class VideoEncoder {
         }
         guard let s = session else {
             lock.unlock()
-            noteFailure("could not start the video encoder (\(lastError))")
+            noteFailure()
             return
         }
         var props: CFDictionary?
@@ -136,6 +155,7 @@ final class VideoEncoder {
             forceKey = false
         }
         let hevc = codec == .hevc
+        encodeCalls += 1
         lock.unlock()
 
         let st = VTCompressionSessionEncodeFrame(s, imageBuffer: pixelBuffer, presentationTimeStamp: pts,
@@ -144,7 +164,7 @@ final class VideoEncoder {
             guard let self = self else { return }
             if status != noErr {
                 self.lastError = "encode \(status)"
-                self.noteFailure("video encoder error \(status)")
+                self.noteFailure()
                 return
             }
             guard let sb = sampleBuffer else { return }  // frame skipped by the encoder
@@ -160,32 +180,41 @@ final class VideoEncoder {
         }
         if st != noErr {
             lastError = "encode \(st)"
-            noteFailure("video encoder error \(st)")
+            noteFailure()
         }
     }
 
-    /// Too many failures in a row: give up on the video chip and let the app send JPEG.
-    private func noteFailure(_ message: String) {
+    /// Failures in a row: start a fresh session with the next set of settings.
+    /// Never lowers quality and never switches to JPEG — the error is reported to the PC.
+    private func noteFailure() {
         lock.lock()
         failures += 1
-        let n = failures
-        let report = n >= 20 && !reportedFailure
-        if report { reportedFailure = true }
-        if n == 10 {  // try once more with a fresh session
+        if failures % 10 == 0 {
+            stage = min(stage + 1, VideoEncoder.stageCount - 1)
             invalidateLocked()
         }
         forceKey = true
-        let cb = onFailure
         lock.unlock()
-        if report { DispatchQueue.main.async { cb?(message) } }
     }
 
-    /// Lets the encoder be tried again (when the user picks H.264/HEVC again).
+    /// Lets the full settings be tried again (when the user changes the format).
     func resetFailures() {
         lock.lock()
         failures = 0
-        reportedFailure = false
+        stage = 0
+        lastError = ""
+        invalidateLocked()
         lock.unlock()
+    }
+
+    /// One line for the PC's screen, e.g. "in 2, out 0, stage 2/3, error encode -12902".
+    func diagnostics() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        var parts = ["stage \(stage + 1)/\(VideoEncoder.stageCount)"]
+        if !lastError.isEmpty { parts.append("error " + lastError) }
+        if !rejected.isEmpty { parts.append("refused: " + rejected.joined(separator: ", ")) }
+        return parts.joined(separator: " · ")
     }
 
     private static let startCode: [UInt8] = [0, 0, 0, 1]
