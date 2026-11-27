@@ -103,7 +103,11 @@ final class CameraModel: NSObject, ObservableObject {
         didSet { guard orientationMode != oldValue else { return }; save(); updateOrientationFromDevice() }
     }
     @Published var codec: StreamCodec = .h264 {
-        didSet { guard codec != oldValue else { return }; save(); updateEncoder(); videoEncoder.requestKeyframe(); sendInfo() }
+        didSet {
+            guard codec != oldValue else { return }
+            if codec != .jpeg { videoEncoder.resetFailures(); videoNote = "" }
+            save(); updateEncoder(); videoEncoder.requestKeyframe(); sendInfo()
+        }
     }
     @Published var bitrateLevel: BitrateLevel = .auto {
         didSet { guard bitrateLevel != oldValue else { return }; save(); updateEncoder(); sendInfo() }
@@ -113,6 +117,8 @@ final class CameraModel: NSObject, ObservableObject {
     }
     /// The PC asked for the microphone.
     @Published private(set) var audioEnabled = false
+    /// Shown on the PC when the video chip failed and the app fell back to JPEG.
+    @Published private(set) var videoNote = ""
     @Published private(set) var micDenied = false
     @Published var mirror = false {
         didSet {
@@ -296,6 +302,11 @@ final class CameraModel: NSObject, ObservableObject {
             DispatchQueue.main.async { self?.congested() }
         }
         videoEncoder.onFallback = { [weak self] _ in self?.codec = .h264 }
+        videoEncoder.onFailure = { [weak self] message in
+            guard let self = self else { return }
+            self.videoNote = message + " — switched to JPEG"
+            self.codec = .jpeg
+        }
         server.start()
         wifi.start(server: server)
 
@@ -958,6 +969,9 @@ final class CameraModel: NSObject, ObservableObject {
             "lowLight": lowLight,
             "audio": audioEnabled,
             "micDenied": micDenied,
+            "videoNote": videoNote,
+            "encodedFrames": videoEncoder.encodedFrames,
+            "encoderError": videoEncoder.lastError,
         ]
         if lastWidth > 0 {
             info["width"] = lastWidth

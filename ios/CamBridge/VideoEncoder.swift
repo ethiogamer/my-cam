@@ -18,6 +18,13 @@ final class VideoEncoder {
     private var forceKey = true
     /// Called when HEVC isn't available and the encoder switched to H.264 by itself.
     var onFallback: ((Codec) -> Void)?
+    /// Called (main thread) when the video chip keeps failing; the app then sends JPEG.
+    var onFailure: ((String) -> Void)?
+    private var useLowLatency = false
+    private var failures = 0
+    private var reportedFailure = false
+    private(set) var lastError = ""
+    private(set) var encodedFrames = 0
 
     deinit { invalidate() }
 
@@ -68,7 +75,7 @@ final class VideoEncoder {
     private func makeSession(width w: Int32, height h: Int32, codec c: Codec) -> VTCompressionSession? {
         let type = c == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
         var spec: CFDictionary?
-        if c == .h264 {
+        if c == .h264 && useLowLatency {
             spec = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String: NSNumber(value: true)] as CFDictionary
         }
         var s: VTCompressionSession?
@@ -82,7 +89,10 @@ final class VideoEncoder {
                                                 imageBufferAttributes: nil, compressedDataAllocator: nil,
                                                 outputCallback: nil, refcon: nil, compressionSessionOut: &s)
         }
-        guard status == noErr, let session = s else { return nil }
+        guard status == noErr, let session = s else {
+            lastError = "create \(status)"
+            return nil
+        }
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
@@ -117,6 +127,7 @@ final class VideoEncoder {
         }
         guard let s = session else {
             lock.unlock()
+            noteFailure("could not start the video encoder (\(lastError))")
             return
         }
         var props: CFDictionary?
@@ -127,16 +138,54 @@ final class VideoEncoder {
         let hevc = codec == .hevc
         lock.unlock()
 
-        VTCompressionSessionEncodeFrame(s, imageBuffer: pixelBuffer, presentationTimeStamp: pts,
-                                        duration: .invalid, frameProperties: props, infoFlagsOut: nil) {
+        let st = VTCompressionSessionEncodeFrame(s, imageBuffer: pixelBuffer, presentationTimeStamp: pts,
+                                                 duration: .invalid, frameProperties: props, infoFlagsOut: nil) {
             [weak self] status, _, sampleBuffer in
-            guard status == noErr, let sb = sampleBuffer,
-                  let result = VideoEncoder.annexB(sb, hevc: hevc) else {
-                self?.requestKeyframe()
+            guard let self = self else { return }
+            if status != noErr {
+                self.lastError = "encode \(status)"
+                self.noteFailure("video encoder error \(status)")
                 return
             }
+            guard let sb = sampleBuffer else { return }  // frame skipped by the encoder
+            guard let result = VideoEncoder.annexB(sb, hevc: hevc) else {
+                self.requestKeyframe()
+                return
+            }
+            self.lock.lock()
+            self.failures = 0
+            self.encodedFrames += 1
+            self.lock.unlock()
             output(result.0, result.1)
         }
+        if st != noErr {
+            lastError = "encode \(st)"
+            noteFailure("video encoder error \(st)")
+        }
+    }
+
+    /// Too many failures in a row: give up on the video chip and let the app send JPEG.
+    private func noteFailure(_ message: String) {
+        lock.lock()
+        failures += 1
+        let n = failures
+        let report = n >= 20 && !reportedFailure
+        if report { reportedFailure = true }
+        if n == 10 {  // try once more with a fresh session
+            invalidateLocked()
+        }
+        forceKey = true
+        let cb = onFailure
+        lock.unlock()
+        if report { DispatchQueue.main.async { cb?(message) } }
+    }
+
+    /// Lets the encoder be tried again (when the user picks H.264/HEVC again).
+    func resetFailures() {
+        lock.lock()
+        failures = 0
+        reportedFailure = false
+        lock.unlock()
     }
 
     private static let startCode: [UInt8] = [0, 0, 0, 1]

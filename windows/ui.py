@@ -1453,6 +1453,9 @@ class App:
             warnings.append("Phone is hot — take it out of its case or choose 30 fps.")
         if info.get("fps") and info.get("actualFps") and info["actualFps"] < info["fps"]:
             warnings.append("This lens can't do %s fps; using %s." % (info["fps"], info["actualFps"]))
+        note = info.get("videoNote") or (self.link.video_note if self.connected else "")
+        if note and info.get("codec") == "jpeg":
+            warnings.append(note)
         if self.pump.record_error:
             warnings.append("Recording problem: %s" % self.pump.record_error)
         if not self.connected and detail and state != "connected":
